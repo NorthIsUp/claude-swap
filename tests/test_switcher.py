@@ -12505,8 +12505,16 @@ class TestLoginExpiry:
         from claude_swap.json_output import USAGE_LOGIN_EXPIRED, USAGE_RELOGIN_REQUIRED
         from claude_swap.switcher import dead_token_sentinel
 
+        now_ms = int(time.time() * 1000)
+        lapsed = self._creds(now_ms - 1000)
+        live = self._creds(now_ms + 20 * self.DAY_MS)
         assert dead_token_sentinel(UsageEntry(last_error="login_expired")) == USAGE_LOGIN_EXPIRED
         assert dead_token_sentinel(UsageEntry(last_error="invalid_grant")) == USAGE_RELOGIN_REQUIRED
+        assert dead_token_sentinel(UsageEntry(last_error="invalid_grant"), live) == USAGE_RELOGIN_REQUIRED
+        # A legacy strike (written before the cause was named) still reads as
+        # the login lapsing when the stored deadline has passed.
+        assert dead_token_sentinel(UsageEntry(last_error="invalid_grant"), lapsed) == USAGE_LOGIN_EXPIRED
+        assert dead_token_sentinel(UsageEntry(last_error="no_refresh_token"), lapsed) == USAGE_RELOGIN_REQUIRED
         assert dead_token_sentinel(UsageEntry()) == USAGE_RELOGIN_REQUIRED
 
     def test_warning_line_only_inside_the_last_week_and_never_over_a_quarantine(self):

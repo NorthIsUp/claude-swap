@@ -222,15 +222,21 @@ SENTINEL_NOTES = {
 }
 
 
-def dead_token_sentinel(entry: UsageEntry) -> str:
+def dead_token_sentinel(entry: UsageEntry, credentials: str = "") -> str:
     """The sentinel for a quarantined slot, named by what the verdict was.
 
     A strike recorded as ``login_expired`` (``oauth.permanent_refresh_kind``:
     the server refused the grant after the login's recorded deadline) reads
-    as the login lapsing on schedule; any other permanent verdict keeps the
+    as the login lapsing on schedule. So does a plain ``invalid_grant`` strike
+    whose stored credential carries a deadline that has passed — a strike
+    written by a release that did not yet name the cause, or by a peer
+    surface still running one; the stored stamp is the same evidence
+    ``permanent_refresh_kind`` read. Any other permanent verdict keeps the
     generic dead-token wording.
     """
     if entry.last_error == "login_expired":
+        return USAGE_LOGIN_EXPIRED
+    if entry.last_error == "invalid_grant" and oauth.is_login_expired(credentials):
         return USAGE_LOGIN_EXPIRED
     return USAGE_RELOGIN_REQUIRED
 
@@ -5058,7 +5064,7 @@ class ClaudeAccountSwitcher:
             entry = entries[num]
             _i = info_by_num[num]
             if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
-                sentinels[num] = dead_token_sentinel(entry)
+                sentinels[num] = dead_token_sentinel(entry, _i[5])
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict.
@@ -5133,7 +5139,7 @@ class ClaudeAccountSwitcher:
                 if self._entry_token_dead(
                     entries[num], num, _i[1], _i[5], _i[4]
                 ):
-                    sentinels[num] = dead_token_sentinel(entries[num])
+                    sentinels[num] = dead_token_sentinel(entries[num], _i[5])
 
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
