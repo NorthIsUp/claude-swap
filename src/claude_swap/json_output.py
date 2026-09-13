@@ -34,7 +34,7 @@ USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
 USAGE_RELOGIN_REQUIRED = "re-login needed"
 # Same quarantine, named by its cause: the server rejected the refresh grant
 # AFTER the login's recorded deadline (``refreshTokenExpiresAt``) had passed —
-# a Claude Code login lasting its ~30 days, not a refresh token lost to a race
+# a Claude Code login reaching its deadline, not a refresh token lost to a race
 # or another machine. Projects to the same ``relogin_required`` status (the
 # remedy is identical, and scripts key on that) while the human note stops
 # sending anyone hunting for a thief.

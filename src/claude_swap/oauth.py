@@ -87,7 +87,9 @@ def login_expires_at_ms(credentials: str) -> int | None:
     token endpoint's ``refresh_token_expires_in``) next to the access token's
     ``expiresAt``. The two age differently: the access token is renewed from
     the refresh token on its own, while the refresh token lineage has a hard
-    deadline set at login (~30 days) that no refresh extends. Once it lapses
+    deadline set at login that no refresh extends (Anthropic documents that
+    logins expire and warns three days out, but not the lifetime; measured
+    27–30 days across a dozen logins). Once it lapses
     the token endpoint answers ``invalid_grant`` and nothing short of logging
     in again fixes it. Logins issued before Claude Code recorded the field
     carry nothing, which means "unknown", never "now".

@@ -12576,7 +12576,7 @@ class TestLoginExpiry:
              patch("claude_swap.session.read_session_credentials", return_value=None):
             switcher.list_accounts()
             output = capsys.readouterr().out
-            assert "re-login needed — login expired (Claude Code logins last about 30 days)" in output
+            assert "re-login needed — login expired (Claude Code logins expire about a month after login)" in output
             assert "refresh token dead" not in output
             # The quarantine holds on the next pass without another POST, and
             # the heads-up line does not double up under the sentinel.

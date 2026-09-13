@@ -197,14 +197,14 @@ ERROR_NOTES = {
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
     "login_expired": (
-        "the stored login has expired (Claude Code logins last about 30 "
-        "days) — log in with Claude Code, then run: cswap add"
+        "the stored login has expired (Claude Code logins expire about a "
+        "month after login) — log in with Claude Code, then run: cswap add"
     ),
 }
 
 # The remedy for a dead lineage is the same whatever killed it; the note is
 # not. "refresh token dead" sends the reader looking for what spent the token
-# (another machine, a torn write) — when the login simply reached the ~30-day
+# (another machine, a torn write) — when the login simply reached the
 # deadline Claude Code stamped at login, that search finds nothing and costs
 # an afternoon. ``dead_token_sentinel`` picks between the two.
 _RELOGIN_REMEDY = "log in with Claude Code, then run: cswap add"
@@ -216,8 +216,8 @@ SENTINEL_NOTES = {
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
     USAGE_RELOGIN_REQUIRED: f"re-login needed — refresh token dead; {_RELOGIN_REMEDY}",
     USAGE_LOGIN_EXPIRED: (
-        "re-login needed — login expired (Claude Code logins last about 30 "
-        f"days); {_RELOGIN_REMEDY}"
+        "re-login needed — login expired (Claude Code logins expire about a "
+        f"month after login); {_RELOGIN_REMEDY}"
     ),
 }
 
