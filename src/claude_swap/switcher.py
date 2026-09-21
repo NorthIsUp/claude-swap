@@ -6457,6 +6457,14 @@ class ClaudeAccountSwitcher:
           ``"unresolved"`` and the fail-open backup copied the empty tokens
           over the slot's only surviving refresh token. Never written into
           any slot; nothing worth preserving either.
+        - ``"oauth-absent"``   — the live store carries no ``claudeAiOauth``
+          section at all while the slot's backup does: an API key in the
+          live position, or a credentials item left holding only
+          ``mcpOAuth`` after one (issue #383). Structurally the same loss
+          as ``"wiped"`` one step earlier — ``extract_oauth_data`` answers
+          ``None`` rather than an empty-token dict, so the ``"wiped"``
+          check misses it and the fail-open backup destroys the slot's
+          refresh token. Never written into any slot.
         - ``"alien"``          — a *structurally complete* identity (uuid +
           email + organization) that matches no managed slot (unmanaged
           login, recycled email wearing a managed address, or an email+org
@@ -6493,6 +6501,13 @@ class ClaudeAccountSwitcher:
             live_oauth.get("accessToken") or live_oauth.get("refreshToken")
         ):
             return ("wiped", None)
+        if live_oauth is None and backup and oauth.extract_oauth_data(backup):
+            # Gated on the BACKUP having OAuth: an API-key slot's live bytes
+            # are legitimately OAuth-less, and its backup is too, so the
+            # guard stays clear of them. Only the asymmetry — nothing to
+            # preserve on the live side, a refresh token to lose on the
+            # slot's — is the destruction case.
+            return ("oauth-absent", None)
         resolved = provenance.get("resolved")
         if resolved is None or provenance.get("live") != original_creds:
             if self._probe_verdicts.get(
@@ -7098,6 +7113,26 @@ class ClaudeAccountSwitcher:
                     msg = (
                         "The live credential's tokens were wiped (Claude "
                         "Code clears them when a refresh is rejected). "
+                        f"Account-{current_account}'s stored backup was "
+                        "kept. If the account cannot authenticate after "
+                        "switching back, log in with Claude Code and run: "
+                        "cswap add"
+                    )
+                    if emit_output:
+                        warning(msg)
+                    else:
+                        warnings_out.append(msg)
+                elif kind == "oauth-absent":
+                    # No OAuth section in the live store at all (an API key
+                    # in the live position, or an mcpOAuth-only leftover).
+                    # Same reasoning as "wiped": nothing to preserve, and
+                    # writing it replaces the slot's only refresh token.
+                    self._write_account_config(
+                        current_account, current_email, original_config
+                    )
+                    msg = (
+                        "The live credential holds no Claude login (an API "
+                        "key, or an emptied credentials store). "
                         f"Account-{current_account}'s stored backup was "
                         "kept. If the account cannot authenticate after "
                         "switching back, log in with Claude Code and run: "
