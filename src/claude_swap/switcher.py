@@ -6446,6 +6446,12 @@ class ClaudeAccountSwitcher:
           here would destroy this slot's only refresh token (issue #117's
           poisoning). Preserved in a safety copy, never written into any
           slot: identity proves ownership, not generation freshness.
+        - ``"foreign-newer"``  — ``"foreign"``, plus the live access token
+          expires strictly later than the owning slot's backup: a later
+          generation of that slot's lineage. Preserved in a safety copy *and*
+          written into ``foreign_slot`` — otherwise that slot keeps a refresh
+          token Claude Code already rotated away (dead on next use) while the
+          live one sits in a stash nothing restores.
         - ``"foreign-synced"`` — resolved to another managed slot whose
           stored backup already holds this exact lineage; nothing needs
           preserving, nothing may be written.
@@ -6580,7 +6586,25 @@ class ClaudeAccountSwitcher:
             == oauth.credential_fingerprint(original_creds)
         ):
             return ("foreign-synced", slot)
+        if self._is_newer_generation(original_creds, foreign_backup):
+            return ("foreign-newer", slot)
         return ("foreign", slot)
+
+    @staticmethod
+    def _is_newer_generation(live: str, backup: str | None) -> bool:
+        """True only when both blobs carry an access-token ``expiresAt`` and
+        the live one is strictly later. Every refresh mints a new access
+        token with a fresh expiry, so a later expiry is a later generation of
+        the lineage; anything unknown answers False (keep the backup)."""
+        live_oauth = oauth.extract_oauth_data(live) or {}
+        backup_oauth = oauth.extract_oauth_data(backup) if backup else None
+        live_exp = live_oauth.get("expiresAt")
+        backup_exp = (backup_oauth or {}).get("expiresAt")
+        return (
+            isinstance(live_exp, (int, float))
+            and isinstance(backup_exp, (int, float))
+            and live_exp > backup_exp
+        )
 
     def _stash_live_credential(
         self,
@@ -7048,8 +7072,8 @@ class ClaudeAccountSwitcher:
                     current_account, current_email, original_creds,
                     provenance, data,
                 )
-                if kind in ("foreign", "alien", "known-foreign"):
-                    # Positively not this slot's bytes: never into a slot;
+                if kind in ("foreign", "foreign-newer", "alien", "known-foreign"):
+                    # Positively not this slot's bytes: never into this slot;
                     # never silently destroyed. The safety copy (which raises
                     # on failure, aborting before the live store is
                     # overwritten) is the license to proceed.
@@ -7057,7 +7081,23 @@ class ClaudeAccountSwitcher:
                         original_creds, kind, current_account,
                         provenance.get("resolved"),
                     )
-                    if kind == "foreign":
+                    if kind == "foreign-newer":
+                        assert foreign_slot is not None
+                        foreign_email = (
+                            data.get("accounts", {})
+                            .get(foreign_slot, {})
+                            .get("email", "")
+                        )
+                        self._write_account_credentials(
+                            foreign_slot, foreign_email, original_creds
+                        )
+                        msg = (
+                            "The live login belonged to Account-"
+                            f"{foreign_slot} and was newer than its stored "
+                            f"backup, so it was saved into Account-"
+                            f"{foreign_slot} (not Account-{current_account})."
+                        )
+                    elif kind == "foreign":
                         msg = (
                             "Credential ownership mismatch detected. The live "
                             "credential was preserved and was not written "
