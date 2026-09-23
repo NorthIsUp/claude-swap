@@ -6586,25 +6586,9 @@ class ClaudeAccountSwitcher:
             == oauth.credential_fingerprint(original_creds)
         ):
             return ("foreign-synced", slot)
-        if self._is_newer_generation(original_creds, foreign_backup):
+        if oauth.is_newer_generation(original_creds, foreign_backup):
             return ("foreign-newer", slot)
         return ("foreign", slot)
-
-    @staticmethod
-    def _is_newer_generation(live: str, backup: str | None) -> bool:
-        """True only when both blobs carry an access-token ``expiresAt`` and
-        the live one is strictly later. Every refresh mints a new access
-        token with a fresh expiry, so a later expiry is a later generation of
-        the lineage; anything unknown answers False (keep the backup)."""
-        live_oauth = oauth.extract_oauth_data(live) or {}
-        backup_oauth = oauth.extract_oauth_data(backup) if backup else None
-        live_exp = live_oauth.get("expiresAt")
-        backup_exp = (backup_oauth or {}).get("expiresAt")
-        return (
-            isinstance(live_exp, (int, float))
-            and isinstance(backup_exp, (int, float))
-            and live_exp > backup_exp
-        )
 
     def _stash_live_credential(
         self,
@@ -7081,16 +7065,15 @@ class ClaudeAccountSwitcher:
                         original_creds, kind, current_account,
                         provenance.get("resolved"),
                     )
-                    if kind == "foreign-newer":
-                        assert foreign_slot is not None
-                        foreign_email = (
-                            data.get("accounts", {})
-                            .get(foreign_slot, {})
-                            .get("email", "")
-                        )
+                    if kind == "foreign-newer" and foreign_slot is not None:
+                        # A later generation of the owning slot's lineage:
+                        # its backup's refresh token is already rotated away.
                         self._write_account_credentials(
-                            foreign_slot, foreign_email, original_creds
+                            foreign_slot,
+                            data["accounts"][foreign_slot].get("email", ""),
+                            original_creds,
                         )
+                    if kind == "foreign-newer":
                         msg = (
                             "The live login belonged to Account-"
                             f"{foreign_slot} and was newer than its stored "
@@ -7139,42 +7122,27 @@ class ClaudeAccountSwitcher:
                         warning(msg)
                     else:
                         warnings_out.append(msg)
-                elif kind == "wiped":
-                    # Claude Code emptied the live token fields in place
-                    # (its invalid_grant reaction). The blob carries nothing
-                    # to preserve and writing it would replace the slot's
-                    # only surviving refresh token with empty strings — the
-                    # exact destruction chain observed in the field. Config
-                    # backup only; the slot's credential backup is the
+                elif kind in ("wiped", "oauth-absent"):
+                    # Nothing to preserve on the live side, and writing it
+                    # would replace the slot's only surviving refresh token:
+                    # "wiped" is Claude Code emptying the token fields in
+                    # place (its invalid_grant reaction), "oauth-absent" an
+                    # API key or mcpOAuth-only leftover in the live position.
+                    # Config backup only; the slot's credential backup is the
                     # recovery path.
                     self._write_account_config(
                         current_account, current_email, original_config
                     )
+                    cause = {
+                        "wiped": "The live credential's tokens were wiped "
+                        "(Claude Code clears them when a refresh is "
+                        "rejected).",
+                        "oauth-absent": "The live credential holds no Claude "
+                        "login (an API key, or an emptied credentials store).",
+                    }[kind]
                     msg = (
-                        "The live credential's tokens were wiped (Claude "
-                        "Code clears them when a refresh is rejected). "
-                        f"Account-{current_account}'s stored backup was "
-                        "kept. If the account cannot authenticate after "
-                        "switching back, log in with Claude Code and run: "
-                        "cswap add"
-                    )
-                    if emit_output:
-                        warning(msg)
-                    else:
-                        warnings_out.append(msg)
-                elif kind == "oauth-absent":
-                    # No OAuth section in the live store at all (an API key
-                    # in the live position, or an mcpOAuth-only leftover).
-                    # Same reasoning as "wiped": nothing to preserve, and
-                    # writing it replaces the slot's only refresh token.
-                    self._write_account_config(
-                        current_account, current_email, original_config
-                    )
-                    msg = (
-                        "The live credential holds no Claude login (an API "
-                        "key, or an emptied credentials store). "
-                        f"Account-{current_account}'s stored backup was "
-                        "kept. If the account cannot authenticate after "
+                        f"{cause} Account-{current_account}'s stored backup "
+                        "was kept. If the account cannot authenticate after "
                         "switching back, log in with Claude Code and run: "
                         "cswap add"
                     )
