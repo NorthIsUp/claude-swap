@@ -199,6 +199,10 @@ class TestMoveAccount:
         if sys.platform == "win32" or os.geteuid() == 0:
             pytest.skip("needs POSIX permission semantics (non-root)")
         switcher = ClaudeAccountSwitcher()
+        # This test is specifically about an inaccessible file-backend
+        # directory. On macOS the default backend is Keychain, so force the
+        # file path instead of accidentally testing a different store.
+        switcher.platform = Platform.LINUX
         self._write(switcher, sample_sequence_data)
         switcher._write_account_credentials(
             "5", "account2@example.com", "stale-foreign"
