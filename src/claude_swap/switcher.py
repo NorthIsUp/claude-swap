@@ -5807,6 +5807,7 @@ class ClaudeAccountSwitcher:
                 account_row(
                     num, email, org_name, org_uuid, is_active,
                     entry.decision_value(),
+                    credentials=creds,
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
                     last_good_usage=entry.last_good,
