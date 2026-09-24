@@ -34,6 +34,7 @@ from claude_swap.json_output import (
     USAGE_FOREIGN_CREDENTIAL,
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
+    USAGE_LOGIN_EXPIRED,
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
     account_ref,
@@ -76,6 +77,7 @@ from claude_swap.printer import (
     ide_short_name,
     muted,
     warning,
+    yellowed,
 )
 from claude_swap.paths import (
     get_backup_root,
@@ -213,15 +215,82 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    "login_expired": (
+        "the stored login has expired (Claude Code logins expire about a "
+        "month after login) — log in with Claude Code, then run: cswap add"
+    ),
 }
+
+# The remedy for a dead lineage is the same whatever killed it; the note is
+# not. "refresh token dead" sends the reader looking for what spent the token
+# (another machine, a torn write) — when the login simply reached the
+# deadline Claude Code stamped at login, that search finds nothing and costs
+# an afternoon. ``dead_token_sentinel`` picks between the two.
+_RELOGIN_REMEDY = "log in with Claude Code, then run: cswap add"
 
 SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
-    USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
+    USAGE_RELOGIN_REQUIRED: f"re-login needed — refresh token dead; {_RELOGIN_REMEDY}",
+    USAGE_LOGIN_EXPIRED: (
+        "re-login needed — login expired (Claude Code logins expire about a "
+        f"month after login); {_RELOGIN_REMEDY}"
+    ),
 }
+
+
+def dead_token_sentinel(entry: UsageEntry, credentials: str = "") -> str:
+    """The sentinel for a quarantined slot, named by what the verdict was.
+
+    A strike recorded as ``login_expired`` (``oauth.permanent_refresh_kind``:
+    the server refused the grant after the login's recorded deadline) reads
+    as the login lapsing on schedule. So does a plain ``invalid_grant`` strike
+    whose stored credential carries a deadline that has passed — a strike
+    written by a release that did not yet name the cause, or by a peer
+    surface still running one; the stored stamp is the same evidence
+    ``permanent_refresh_kind`` read. Any other permanent verdict keeps the
+    generic dead-token wording.
+    """
+    if entry.last_error == "login_expired":
+        return USAGE_LOGIN_EXPIRED
+    if entry.last_error == "invalid_grant" and oauth.is_login_expired(credentials):
+        return USAGE_LOGIN_EXPIRED
+    return USAGE_RELOGIN_REQUIRED
+
+
+def login_expiry_warning_from_ms(
+    deadline_ms: float | None,
+    sentinel: str | None,
+    now_ms: int | None = None,
+) -> str | None:
+    """A one-line heads-up when a login is inside its last week.
+
+    Rendered under the usage lines of ``cswap list`` and on the TUI card (no
+    flag needed — the point is to be seen before the deadline, and
+    ``--token-status`` is the line nobody reads until something is already
+    dead). Silent once the slot is quarantined for that very reason (the
+    sentinel already says it), and silent for logins that record no deadline.
+    """
+    if sentinel in (USAGE_LOGIN_EXPIRED, USAGE_RELOGIN_REQUIRED):
+        return None
+    if not oauth.login_expiring_soon_ms(deadline_ms, now_ms):
+        return None
+    note = oauth.login_expiry_note_ms(deadline_ms, now_ms)
+    if note is None:
+        return None
+    now = now_ms if now_ms is not None else oauth._now_ms()
+    if deadline_ms is not None and now >= deadline_ms:
+        return f"{note} — re-login needed: {_RELOGIN_REMEDY}"
+    return f"{note} — re-login before then: {_RELOGIN_REMEDY}"
+
+
+def login_expiry_warning_line(credentials: str, entry: UsageEntry) -> str | None:
+    """:func:`login_expiry_warning_from_ms` for a stored credential."""
+    return login_expiry_warning_from_ms(
+        oauth.login_expires_at_ms(credentials), entry.sentinel
+    )
 
 
 def last_seen_note(entry: UsageEntry) -> str | None:
@@ -1812,6 +1881,7 @@ class ClaudeAccountSwitcher:
                         if (exp := self._expires_from_data(seq_data, n)) is not None
                         else None
                     ),
+                    login_expires_at=oauth.login_expires_at_ms(_creds),
                 )
             )
         return AccountsSnapshot(
@@ -5324,7 +5394,7 @@ class ClaudeAccountSwitcher:
             entry = entries[num]
             _i = info_by_num[num]
             if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
-                sentinels[num] = USAGE_RELOGIN_REQUIRED
+                sentinels[num] = dead_token_sentinel(entry, _i[5])
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict.
@@ -5407,7 +5477,7 @@ class ClaudeAccountSwitcher:
                 if self._entry_token_dead(
                     entries[num], num, _i[1], _i[5], _i[4]
                 ):
-                    sentinels[num] = USAGE_RELOGIN_REQUIRED
+                    sentinels[num] = dead_token_sentinel(entries[num], _i[5])
 
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
@@ -5847,6 +5917,7 @@ class ClaudeAccountSwitcher:
                         if (exp := self._expires_from_data(seq_data, str(num))) is not None
                         else None
                     ),
+                    login_expired=oauth.is_login_expired(creds),
                 )
             )
         payload = {
@@ -5918,6 +5989,11 @@ class ClaudeAccountSwitcher:
                 print(f"     {muted(f'expires {expires.isoformat()} ({days:+d}d)')}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
+            expiry_line = login_expiry_warning_line(
+                accounts_info[i][5], entries[str(num)]
+            )
+            if expiry_line is not None:
+                print(f"     {yellowed(expiry_line)}")
 
             if show_token_status:
                 for line in self._token_status_lines(accounts_info[i]):
