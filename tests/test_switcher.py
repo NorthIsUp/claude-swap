@@ -7564,6 +7564,29 @@ class TestProvenanceGuard:
                 p.stop()
         assert creds_store[("1", "test@example.com")] == "sk-ant-api03-new"
 
+    def test_mcp_only_live_never_overwrites_an_api_key_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """An API-key slot's live read becomes an mcpOAuth-only blob once
+        Claude Code re-auths an MCP server; backing that up destroyed the
+        slot's only copy of the key."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = "sk-ant-api03-key"
+        live_state = {"creds": json.dumps({"mcpOAuth": {
+            "some-server|abc123": {"serverName": "some-server"},
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == "sk-ant-api03-key"
+
     def test_moved_bytes_between_prefetch_and_lock_fall_to_unresolved(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):

@@ -792,7 +792,7 @@ def run(switcher) -> int:
             # nothing useful in a menu bar, so fall back to the last good read.
             others = [
                 (alias or _local_part(email), display if isinstance(display, dict) else last_good)
-                for _num, email, is_active, display, last_good, alias, _disabled, _fetched
+                for _num, email, is_active, display, last_good, alias, _disabled, _fetched, _expires_at
                 in self.snapshot["accounts"]
                 if not is_active
             ]
@@ -885,7 +885,7 @@ def run(switcher) -> int:
             if active is None:
                 rumps.alert(title="claude-swap", message="No active account to rename.")
                 return
-            num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at = active
+            num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at, _expires_at = active
 
             win = rumps.Window(
                 title="Change alias",
