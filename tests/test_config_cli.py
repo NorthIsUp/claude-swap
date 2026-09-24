@@ -50,6 +50,7 @@ class TestConfigList:
             "autoswitch.model",
             "autoswitch.notify",
             "ui.theme",
+            "swap.designLogin",
         ):
             assert key in out
         assert out.count("(default)") == 10
