@@ -6507,12 +6507,19 @@ class ClaudeAccountSwitcher:
             live_oauth.get("accessToken") or live_oauth.get("refreshToken")
         ):
             return ("wiped", None)
-        if live_oauth is None and backup and oauth.extract_oauth_data(backup):
-            # Gated on the BACKUP having OAuth: an API-key slot's live bytes
-            # are legitimately OAuth-less, and its backup is too, so the
-            # guard stays clear of them. Only the asymmetry — nothing to
-            # preserve on the live side, a refresh token to lose on the
-            # slot's — is the destruction case.
+        if live_oauth is None and backup and (
+            oauth.extract_oauth_data(backup)
+            # An API-key slot's live read turns into an mcpOAuth-only blob
+            # once Claude Code re-auths an MCP server into the OAuth item,
+            # which _read_active_credentials prefers over the managed key.
+            or (
+                looks_like_api_key(backup)
+                and not looks_like_api_key(original_creds)
+            )
+        ):
+            # Only the asymmetry — nothing to preserve on the live side, a
+            # refresh token or API key to lose on the slot's — is the
+            # destruction case.
             return ("oauth-absent", None)
         resolved = provenance.get("resolved")
         if resolved is None or provenance.get("live") != original_creds:
