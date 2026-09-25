@@ -248,6 +248,35 @@ class TestCLI:
         assert excinfo.value.code == 2
         assert "--model can only be used with" in capsys.readouterr().err
 
+    def test_switch_strategy_expiring_forwarded_with_model(self):
+        """--strategy expiring is a usage-aware strategy: accepted, forwarded,
+        and --model folds into it like best/next-available."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", [
+                 "claude-swap", "switch", "--strategy", "expiring", "--model", "Fable",
+             ]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.settings.load_settings",
+                   return_value=AutoSwitchSettings()), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch.assert_called_once_with(
+            strategy="expiring", json_output=False,
+            models=("Fable",), model_source="cli",
+        )
+
+    def test_auto_rejects_expiring_strategy(self, capsys):
+        """The daemon has no expiration-aware strategy; argparse must say so
+        rather than silently running `best`."""
+        with patch.object(sys, "argv", ["claude-swap", "auto", "--strategy", "expiring"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "invalid choice" in capsys.readouterr().err
+
     def test_plain_switch_passes_no_strategy(self):
         """Bare --switch forwards strategy=None."""
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
@@ -742,12 +771,20 @@ class TestRunCommand:
                 claude_args,
                 share=True,
                 share_history=False,
+                share_plugins=False,
                 require_session=False,
             ):
-                calls.append((
-                    "run", identifier, claude_args, share, share_history,
-                    require_session,
-                ))
+                calls.append(
+                    (
+                        "run",
+                        identifier,
+                        claude_args,
+                        share,
+                        share_history,
+                        share_plugins,
+                        require_session,
+                    )
+                )
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
              patch("claude_swap.cli.ClaudeAccountSwitcher"), \
@@ -758,36 +795,46 @@ class TestRunCommand:
 
     def test_run_dispatches_with_defaults(self):
         calls = self._dispatch(["run", "2"])
-        assert ("run", "2", [], True, False, False) in calls
+        assert ("run", "2", [], True, False, False, False) in calls
 
     def test_run_by_email(self):
         calls = self._dispatch(["run", "user@example.com"])
-        assert ("run", "user@example.com", [], True, False, False) in calls
+        assert ("run", "user@example.com", [], True, False, False, False) in calls
 
     def test_no_share_flag(self):
         calls = self._dispatch(["run", "2", "--no-share"])
-        assert ("run", "2", [], False, False, False) in calls
+        assert ("run", "2", [], False, False, False, False) in calls
 
     def test_share_history_flag(self):
         calls = self._dispatch(["run", "2", "--share-history"])
-        assert ("run", "2", [], True, True, False) in calls
+        assert ("run", "2", [], True, True, False, False) in calls
 
     def test_no_share_history_flag(self):
         calls = self._dispatch(["run", "2", "--no-share-history"])
-        assert ("run", "2", [], True, False, False) in calls
+        assert ("run", "2", [], True, False, False, False) in calls
+
+    def test_share_plugins_flag(self):
+        calls = self._dispatch(["run", "2", "--share-plugins"])
+        assert ("run", "2", [], True, False, True, False) in calls
+
+    def test_no_share_plugins_flag(self):
+        calls = self._dispatch(["run", "2", "--no-share-plugins"])
+        assert ("run", "2", [], True, False, False, False) in calls
 
     def test_require_session_flag(self):
         calls = self._dispatch(["run", "2", "--require-session"])
-        assert ("run", "2", [], True, False, True) in calls
+        assert ("run", "2", [], True, False, False, True) in calls
 
     def test_tail_forwarded_verbatim(self):
         calls = self._dispatch(["run", "2", "--", "--resume", "--model", "x"])
-        assert ("run", "2", ["--resume", "--model", "x"], True, False, False) in calls
+        assert (
+            "run", "2", ["--resume", "--model", "x"], True, False, False, False,
+        ) in calls
 
     def test_tail_may_contain_run_flags(self):
         """Args after `--` are NOT parsed by cswap, even if they look like ours."""
         calls = self._dispatch(["run", "2", "--", "--no-share"])
-        assert ("run", "2", ["--no-share"], True, False, False) in calls
+        assert ("run", "2", ["--no-share"], True, False, False, False) in calls
 
     def test_run_unknown_flag_errors(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "run", "2", "--bogus"]):
@@ -833,6 +880,7 @@ class TestRunCommand:
                 claude_args,
                 share=True,
                 share_history=False,
+                share_plugins=False,
                 require_session=False,
             ):
                 from claude_swap.exceptions import SessionError
@@ -942,6 +990,7 @@ class TestSubcommandAliases:
                 claude_args,
                 share=True,
                 share_history=False,
+                share_plugins=False,
                 require_session=False,
             ):
                 calls.append((identifier, claude_args, share))
@@ -1539,9 +1588,19 @@ class TestRunAutoResolve:
                 claude_args,
                 share=True,
                 share_history=False,
+                share_plugins=False,
                 require_session=False,
             ):
-                calls.append(("run", identifier, claude_args, share, share_history))
+                calls.append(
+                    (
+                        "run",
+                        identifier,
+                        claude_args,
+                        share,
+                        share_history,
+                        share_plugins,
+                    )
+                )
 
             def exec_default(self, claude_args):
                 calls.append(("exec_default", claude_args))
@@ -1585,7 +1644,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], True, False, False) in calls
 
     def test_mapped_subdir_inherits(self, tmp_path, monkeypatch):
         from claude_swap.mappings import MappingStore
@@ -1609,7 +1668,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], True, False, False) in calls
 
     def test_unmapped_dir_falls_back_to_default(self, tmp_path, monkeypatch, capsys):
         backup = tmp_path / "backup"
@@ -1658,7 +1717,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "3"]):
             cli.main()
-        assert ("run", "3", [], True, False) in calls
+        assert ("run", "3", [], True, False, False) in calls
 
     def test_no_account_forwards_tail(self, tmp_path, monkeypatch):
         from claude_swap.mappings import MappingStore
@@ -1681,7 +1740,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "--", "--resume"]):
             cli.main()
-        assert ("run", "2", ["--resume"], True, False) in calls
+        assert ("run", "2", ["--resume"], True, False, False) in calls
 
     def test_no_account_forwards_share_history(self, tmp_path, monkeypatch):
         """--share-history survives the mapped-account resolution path."""
@@ -1705,7 +1764,91 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run", "--share-history"]):
             cli.main()
-        assert ("run", "2", [], True, True) in calls
+        assert ("run", "2", [], True, True, False) in calls
+
+
+class TestExpiresCommand:
+    """`cswap expires` — record/clear/list a subscription-cancellation date."""
+
+    def _seeded_switcher_env(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"] = {
+            "email": "work@co.com", "uuid": "u2",
+            "organizationUuid": "", "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [2]
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def _run(self, argv):
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._expires_command(argv)
+
+    def test_set_by_number_and_email(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        self._run(["2", "2030-09-16"])
+        assert ClaudeAccountSwitcher()._get_sequence_data()["accounts"]["2"]["expiresAt"] == "2030-09-16"
+        assert "Recorded Account-2" in capsys.readouterr().out
+
+        self._run(["work@co.com", "2030-09-17"])
+        assert ClaudeAccountSwitcher()._get_sequence_data()["accounts"]["2"]["expiresAt"] == "2030-09-17"
+
+    def test_clear(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        self._run(["2", "2030-09-16"])
+        self._run(["2", "--clear"])
+        assert "expiresAt" not in ClaudeAccountSwitcher()._get_sequence_data()["accounts"]["2"]
+
+    def test_list_marks_lapsed(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        self._run([])
+        assert "No expirations recorded" in capsys.readouterr().out
+
+        self._run(["2", "2000-01-01"])
+        capsys.readouterr()
+        self._run([])
+        out = capsys.readouterr().out
+        assert "2: 2000-01-01 (lapsed)" in out
+        assert "work@co.com" in out
+
+    def test_main_dispatches_expires(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "expires", "2", "2030-09-16"]), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        assert ClaudeAccountSwitcher()._get_sequence_data()["accounts"]["2"]["expiresAt"] == "2030-09-16"
+
+    @pytest.mark.parametrize("argv, fragment", [
+        (["2"], "YYYY-MM-DD is required"),
+        (["2030-09-16"], "NUM|EMAIL is required before the date"),
+        (["--clear"], "NUM|EMAIL is required with --clear"),
+        (["2", "--clear", "2030-09-16"], "--clear does not take"),
+    ])
+    def test_malformed_invocations_error(self, temp_home, capsys, argv, fragment):
+        self._seeded_switcher_env(temp_home)
+        with pytest.raises(SystemExit) as excinfo:
+            self._run(argv)
+        assert excinfo.value.code == 2
+        assert fragment in capsys.readouterr().err
+
+    def test_invalid_date_is_a_clean_error(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with pytest.raises(SystemExit) as excinfo:
+            self._run(["2", "16.09.2030"])
+        assert excinfo.value.code == 1
+        assert "Invalid date" in capsys.readouterr().err
+
+    def test_unknown_account_is_a_clean_error(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with pytest.raises(SystemExit) as excinfo:
+            self._run(["9", "2030-09-16"])
+        assert excinfo.value.code == 1
+        assert "Account-9 does not exist" in capsys.readouterr().err
 
 
 class TestDisableEnableDispatch:
@@ -1743,6 +1886,70 @@ class TestDisableEnableDispatch:
         assert excinfo.value.code == 2
 
 
+class TestEmptyValueArguments:
+    """A required value that arrives empty is a usage error, not a no-op.
+
+    ``cswap export "$DEST"`` with an unset DEST used to match no branch of the
+    dispatch chain and return from main() normally: exit 0, nothing printed,
+    no file written, and no way for the calling script to notice.
+    """
+
+    def _run(self, argv, capsys):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", *argv]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            code = 0
+            try:
+                cli.main()
+            except SystemExit as exc:
+                code = exc.code or 0
+        return code, capsys.readouterr(), switcher_cls
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["remove", ""],
+            ["disable", ""],
+            ["enable", ""],
+            ["switch", ""],
+            ["export", ""],
+            ["import", ""],
+            ["--remove-account", ""],
+            ["--disable-account", ""],
+            ["--enable-account", ""],
+            ["--switch-to", ""],
+            ["--export", ""],
+            ["--import", ""],
+        ],
+    )
+    def test_empty_value_is_rejected(self, argv, capsys):
+        code, captured, switcher_cls = self._run(argv, capsys)
+        assert code == 2, f"{argv} exited {code} having printed {captured.out!r}"
+        assert "requires a non-empty" in captured.err
+        switcher_cls.assert_not_called()
+
+    def test_empty_value_is_blamed_before_its_modifiers(self, capsys):
+        """The empty PATH is the error, not the --account that accompanied it."""
+        _, captured, _ = self._run(["export", "", "--account", "1"], capsys)
+        assert "'export' requires a non-empty PATH" in captured.err
+
+    def test_add_token_still_accepts_an_empty_value(self, capsys):
+        """``--add-token`` uses const="" to mean "prompt me", so it is exempt."""
+        code, captured, switcher_cls = self._run(["--add-token"], capsys)
+        assert code == 0, captured.err
+        switcher_cls.return_value.add_account_from_token.assert_called_once_with(
+            token="", email=None, slot=None
+        )
+
+    def test_a_whitespace_only_path_is_still_a_path(self, capsys):
+        """A filename of spaces is legal on POSIX; only an empty value is rejected."""
+        with patch("claude_swap.transfer.export_accounts") as export_accounts:
+            code, captured, _ = self._run(["export", " "], capsys)
+        assert code == 0, captured.err
+        assert export_accounts.call_args.args[1] == " "
+
+
 def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     """Import must allocate nothing; the fixture must allocate inside basetemp.
 
@@ -1767,3 +1974,42 @@ def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     home = Path(_subprocess_env()["HOME"])
     assert home.is_dir(), f"the isolated HOME is not a real directory: {home}"
     assert home.is_relative_to(tmp_path_factory.getbasetemp()), f"{home} escapes basetemp"
+
+
+class TestImportUsageCli:
+    def _dispatch(self, argv):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.transfer.import_usage") as import_fn, \
+             patch.object(sys, "argv", argv), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        return switcher_cls, import_fn
+
+    def test_subcommand_dispatches_with_its_hold(self):
+        switcher_cls, import_fn = self._dispatch(
+            ["cswap", "import-usage", "-", "--hold", "600"]
+        )
+        import_fn.assert_called_once_with(
+            switcher_cls.return_value, "-", hold_s=600.0
+        )
+
+    def test_no_hold_holds_nothing(self):
+        switcher_cls, import_fn = self._dispatch(
+            ["cswap", "import-usage", "/tmp/usage.json"]
+        )
+        import_fn.assert_called_once_with(
+            switcher_cls.return_value, "/tmp/usage.json", hold_s=0.0
+        )
+
+    @pytest.mark.parametrize("argv,message", [
+        (["cswap", "list", "--hold", "60"], "--hold can only be used with 'import-usage'"),
+        (["cswap", "import-usage", "-", "--hold", "-1"], "--hold must be a non-negative"),
+        (["cswap", "import-usage", "-", "--hold", "inf"], "--hold must be a non-negative"),
+    ])
+    def test_hold_is_validated(self, argv, message, capsys):
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 2
+        assert message in capsys.readouterr().err

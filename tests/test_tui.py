@@ -81,6 +81,7 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
+    expires_at: str | None = None,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -93,6 +94,7 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
+        expires_at=expires_at,
     )
 
 
@@ -593,6 +595,27 @@ class TestUsageRows:
         last_good = {"seven_day": {"pct": 50.0, "resets_at": _iso_in(86400 * 6)}}
         row = usage_rows(last_good, now)[0]
         assert "pace" not in row[2]
+
+    def test_card_shows_recorded_expiration(self):
+        # The date recorded with `cswap expires` rides on the header line the
+        # way `(disabled)` does; absent when nothing is recorded.
+        from claude_swap.tui.widgets import account_card_text
+
+        with_date = account_card_text(make_account(1, expires_at="2026-09-16"), 100).plain
+        without = account_card_text(make_account(1), 100).plain
+        assert "expires 2026-09-16" in with_date.splitlines()[0]
+        assert "expires" not in without
+
+    def test_mini_line_shows_recorded_expiration(self):
+        # Same fact as the full card, on the minimized line for an inactive
+        # account — absent when nothing is recorded.
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        with_date = mini_account_text(make_account(1, expires_at="2026-09-16"), now).plain
+        without = mini_account_text(make_account(1), now).plain
+        assert "expires 2026-09-16" in with_date
+        assert "expires" not in without
 
     def test_card_shows_clock_only_where_it_fits(self):
         # Per-row degradation: the wide card shows every clock, a mid width
@@ -1530,6 +1553,33 @@ class TestAutoScreen:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
+
+    async def test_candidates_demote_and_mark_disabled_accounts(
+        self, tmp_path, fake_engine
+    ):
+        """A disabled slot is held out of automatic rotation, so the engine
+        will never pick it: the panel must rank it below every real candidate
+        and say why, however much headroom it has."""
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(5.0, 5.0), disabled=True),
+                make_account(3, entry=make_entry(50.0, 10.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            # On headroom alone #2 (5% used) would head the list.
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
+            assert "(disabled)" in plain
 
 
 class TestEventText:

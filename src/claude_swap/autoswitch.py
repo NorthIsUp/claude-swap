@@ -24,7 +24,15 @@ consecutive ticks, the engine fails over to any healthy candidate.
 
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
-read-modify-write under a dedicated file lock.
+read-modify-write under a dedicated file lock. Quarantine is a fact about an
+*account* and stays top-level, shared by every engine. The switch history
+(cooldown timestamp, no-return bar, departure snapshot) is a fact about one
+*live config* — engines running under different ``CLAUDE_CONFIG_DIR``s
+operate different live logins, so each config dir gets its own slice under
+``perConfigDir`` (see :meth:`AutoSwitchEngine._switch_state`); otherwise a
+switch in one terminal would start a cooldown and erect no-return bars in
+every other, and any switch anywhere would overwrite the one departure
+snapshot the anti-flap release diffs against.
 """
 
 from __future__ import annotations
@@ -46,17 +54,47 @@ from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
+from claude_swap.mappings import normalize_path
+from claude_swap.paths import get_claude_config_home, get_default_claude_config_home
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_model_names,
+    poll_threshold,
+    window_threshold,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
+# Still 1 after the perConfigDir move: nothing validates the version on read,
+# and every switch-history key was already optional-with-absence-handled, so a
+# pre-upgrade reader of the new shape lands in its existing release paths
+# rather than misparsing — the same treatment the late-added `leftHeadroom`/
+# `leftTrigger` fields got.
 STATE_SCHEMA_VERSION = 1
+
+# The switch-history cluster `_perform` writes as one unit: when/where the
+# last switch landed, and the departure snapshot the no-return release diffs
+# against. Facts about ONE live config, so they live per config dir under
+# `perConfigDir` (keyed by the engine's `scope_key`), never top-level — see
+# the module docstring. Every successful switch overwrites all six, which is
+# also the whole migration story: a pre-upgrade record's top-level keys are
+# honoured by `_switch_state`'s fallback until the first post-upgrade switch
+# retires them.
+SWITCH_HISTORY_KEYS = (
+    "lastSwitchAt",
+    "lastSwitchTo",
+    "lastSwitchFrom",
+    "leftHeadroom",
+    "leftRecoveryAt",
+    "leftTrigger",
+)
 
 _logger = logging.getLogger("claude-swap")
 
@@ -557,6 +595,57 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     return None
 
 
+def _windows_at_threshold(
+    usage: dict | str | None,
+    models: Sequence[str],
+    settings: AutoSwitchSettings,
+) -> list[tuple[str, float, float]]:
+    """Every ``(label, pct, threshold)`` window at or over its own threshold.
+
+    With no per-window override this is exactly ``max(pct) >= threshold``
+    on the same windows ``account_headroom`` reads, so the trigger and the
+    landing gate keep their old meaning unless the user asks for more.
+    """
+    if not isinstance(usage, dict):
+        return []
+    return [
+        (label, pct, window_threshold(label, settings))
+        for label, pct, _resets_at in oauth.relevant_windows(usage, models)
+        if pct >= window_threshold(label, settings)
+    ]
+
+
+def _within_landing_caps(
+    usage: dict | str | None,
+    models: Sequence[str],
+    settings: AutoSwitchSettings,
+) -> bool:
+    """Whether an account may be switched ONTO.
+
+    Judged on each of its own windows, not on the binding max: a 0% 5h /
+    96% 7d account has the same headroom as a 96% 5h / 0% 7d one, but only
+    the second is about to refill. Reads the same window source as every
+    other decision (``oauth.relevant_windows``, same ``models``): the 5h
+    window against ``landing_max_5h_pct``, and the 7d window AND every
+    per-model scoped window named by ``autoswitch.model`` against
+    ``landing_max_7d_pct`` — scoped windows are weekly, and a Fable-pinned
+    session landing on an account whose Fable window is spent is the same
+    failure the cap exists to stop. A window missing from the snapshot does
+    not fail the cap — the caller has already required readable headroom.
+    """
+    if not isinstance(usage, dict):
+        return True
+    for label, pct, _resets_at in oauth.relevant_windows(usage, models):
+        cap = (
+            settings.landing_max_5h_pct
+            if label == "5h"
+            else settings.landing_max_7d_pct
+        )
+        if pct > cap:
+            return False
+    return True
+
+
 def _binding_recovery_ts(
     usage: dict | str | None, models: Sequence[str], now: float
 ) -> float:
@@ -593,12 +682,20 @@ def _binding_recovery_ts(
 
 def _every_account_above_threshold(
     candidates: Sequence[str],
+    usage: dict[str, dict | str | None],
     headroom: dict[str, float | None],
+    current: str,
     active_headroom: float | None,
-    threshold: float,
+    models: Sequence[str],
+    settings: AutoSwitchSettings,
 ) -> bool:
     """Whether the active account AND every measured candidate are at or over
     the threshold — the state where "land somewhere healthy" has no answer.
+
+    "Over the threshold" is judged per window (``_windows_at_threshold``), so
+    it agrees with the trigger and the landing gate when ``threshold5h`` /
+    ``threshold7d`` are set; with neither set all three collapse to the old
+    ``max(pct) >= threshold``.
 
     Requires the active account's own headroom to be known: without it we do
     not know we are in this state, and guessing here would relax the landing
@@ -606,12 +703,16 @@ def _every_account_above_threshold(
     verdict (it may be healthy, but it cannot be *chosen* either — the caller
     skips ``None`` headroom) as long as at least one candidate was measured.
     """
-    if active_headroom is None or (100.0 - active_headroom) < threshold:
+    if active_headroom is None:
         return False
-    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    if not _windows_at_threshold(usage.get(current), models, settings):
+        return False
+    measured = [n for n in candidates if headroom.get(n) is not None]
     if not measured:
         return False
-    return all((100.0 - h) >= threshold for h in measured)
+    return all(
+        _windows_at_threshold(usage.get(n), models, settings) for n in measured
+    )
 
 
 def _ref(number: str, email: str) -> dict:
@@ -647,9 +748,16 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        scope_key: str | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
+        # Which live config this engine operates — the key for its slice of
+        # the shared state file's switch history (see module docstring).
+        # Derived from the process's CLAUDE_CONFIG_DIR resolution by default;
+        # injectable so tests can run differently-scoped engines in one
+        # process, same as `state_path`.
+        self._scope_key = scope_key or normalize_path(get_claude_config_home())
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
@@ -659,7 +767,7 @@ class AutoSwitchEngine:
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
-        switcher.set_poll_policy_inputs(settings.threshold, self._models)
+        switcher.set_poll_policy_inputs(poll_threshold(settings), self._models)
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -696,6 +804,35 @@ class AutoSwitchEngine:
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return {}
         return raw if isinstance(raw, dict) else {}
+
+    def _switch_state(self, state: dict) -> dict:
+        """This engine's slice of the switch history (`SWITCH_HISTORY_KEYS`).
+
+        Every reader of those keys (`_in_cooldown`, `_no_return_account`,
+        `_left_account_recovered`) receives this view, never the raw state:
+        the history describes one live config's last switch, and this engine
+        must not gate on — or release against — a switch some other config
+        dir's engine made.
+
+        Falls back to the full state when no slice exists for this scope, so
+        a pre-upgrade record's top-level keys keep exactly their old meaning
+        until the first post-upgrade switch retires them — replaced by the
+        retiring engine's own slice when the record was its config's, moved
+        into the default profile's slice otherwise (`_perform`). After that,
+        the fallback reads a state with none of the six keys present — the
+        same "absence of evidence releases" shape every reader already
+        handles for records written before a key existed. One skew window is
+        accepted: a still-running pre-upgrade binary writes top-level keys
+        that this engine ignores once its own slice exists, so old and new
+        binaries on one profile owe each other no cooldown until both are
+        upgraded.
+        """
+        scopes = state.get("perConfigDir")
+        if isinstance(scopes, dict):
+            slice_ = scopes.get(self._scope_key)
+            if isinstance(slice_, dict):
+                return slice_
+        return state
 
     def _mutate_state(self, mutator: Callable[[dict], None]) -> dict:
         """Read-modify-write the state file under its lock; returns new state.
@@ -904,6 +1041,10 @@ class AutoSwitchEngine:
             if isinstance(state.get("quarantine"), dict)
             else {}
         )
+        # Quarantine above is per-account and read from the shared state;
+        # everything below that reads switch history reads this engine's own
+        # per-config-dir slice instead.
+        switch_state = self._switch_state(state)
 
         current = self.switcher.current_account_number()
         if current is None:
@@ -935,7 +1076,7 @@ class AutoSwitchEngine:
         }
 
         entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
+            current, quarantined, threshold=poll_threshold(settings)
         )
         self._emit(
             PollEvent(
@@ -977,16 +1118,26 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            active_usage = usage.get(current)
+            if not _windows_at_threshold(active_usage, self._models, settings):
                 if settings.strategy != "consume-first":
+                    # Report the window CLOSEST to its own line — the one
+                    # that will fire next — not the highest percentage: with
+                    # a 5h line at 95 and a weekly line at 99, a 5h at 94
+                    # is nearer to switching than a 7d at 96. headroom is
+                    # known here, so at least one window exists.
+                    closest_label, closest_pct, _reset = max(
+                        oauth.relevant_windows(active_usage, self._models),
+                        key=lambda w: w[1] - window_threshold(w[0], settings),
+                    )
+                    line = window_threshold(closest_label, settings)
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
                             # Both sides through pct_label: .0f utilization could
                             # display an impossible "100% < 99.9%".
                             detail=(
-                                f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                                f"{pct_label(closest_pct)}% < {pct_label(line)}%"
                             ),
                         )
                     )
@@ -1046,7 +1197,9 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger in ("proactive", "consume-first") and self._in_cooldown(
+            switch_state
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1149,7 +1302,7 @@ class AutoSwitchEngine:
             # ranking had already thrown away — `left=20 active=30` bars,
             # `left=90 active=10` releases, and phase 2 is where that flips.
             recovered = self._left_account_recovered(
-                state,
+                switch_state,
                 kw["usage"],
                 kw["headroom"],
                 kw["active_headroom"],
@@ -1159,7 +1312,7 @@ class AutoSwitchEngine:
             )
             no_return = self._no_return_account(
                 trigger,
-                state,
+                switch_state,
                 kw["headroom"],
                 kw["active_headroom"],
                 recovered,
@@ -1275,15 +1428,26 @@ class AutoSwitchEngine:
                 h is not None and h <= 0 for h in candidate_headrooms
             )
             if not truly_exhausted:
-                self._emit(
-                    NoSwitchEvent(
-                        reason="no-qualifying-candidate",
-                        detail=(
-                            "no candidate is below the threshold and better "
-                            "than the active account by the hysteresis "
-                            "margin, or usage is unreadable this tick"
-                        ),
+                # Name the caps when they are what blocked the tick, so the
+                # log says why a healthy-looking peer was not taken.
+                over_caps = [
+                    n
+                    for n in oauth_candidates
+                    if (headroom.get(n) or 0) > 0
+                    and not _within_landing_caps(usage.get(n), self._models, settings)
+                ]
+                detail = (
+                    "no candidate is below the threshold and better "
+                    "than the active account by the hysteresis "
+                    "margin, or usage is unreadable this tick"
+                )
+                if over_caps:
+                    detail += (
+                        f"; {len(over_caps)} candidate(s) over the landing "
+                        "caps (landingMax5hPct / landingMax7dPct)"
                     )
+                self._emit(
+                    NoSwitchEvent(reason="no-qualifying-candidate", detail=detail)
                 )
                 return TickOutcome.BLOCKED
             self._blocked_wait_long = True
@@ -1775,8 +1939,13 @@ class AutoSwitchEngine:
         """
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
+        # weekly-first ranks on the same weekly-reset axis as consume-first;
+        # the difference is upstream, in _tick_inner: it never fires below
+        # the threshold.
+        weekly_first = settings.strategy == "weekly-first"
+        by_weekly_reset = consume_first or weekly_first
         active_reset_ts = (
-            _seven_day_reset_ts(usage.get(current), now) if consume_first else None
+            _seven_day_reset_ts(usage.get(current), now) if by_weekly_reset else None
         )
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
@@ -1791,7 +1960,13 @@ class AutoSwitchEngine:
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates,
+            usage,
+            headroom,
+            current,
+            active_headroom,
+            self._models,
+            settings,
         )
         # "Is anything worth having?" — the most headroom any candidate with a
         # READABLE row offers. Two exclusions and no others:
@@ -1835,8 +2010,19 @@ class AutoSwitchEngine:
                 continue  # itself at its limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
+            if trigger != "failover" and not _within_landing_caps(
+                usage.get(num), self._models, settings
+            ):
+                # Every strategy, and every trigger but failover. Landing on
+                # an account that is itself nearly spent moves the rate limit
+                # rather than avoiding it — the at-limit escape included: a
+                # blocked account waits for its own reset instead. Failover
+                # is different: the active account is dead or unreadable, so
+                # there is nothing to wait for, and any account with headroom
+                # is a strict improvement over one that cannot work at all.
+                continue
             reset_ts = (
-                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+                _seven_day_reset_ts(usage.get(num), now) if by_weekly_reset else None
             )
             recovery_ts = (
                 _binding_recovery_ts(usage.get(num), self._models, now)
@@ -1848,7 +2034,10 @@ class AutoSwitchEngine:
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                if (
+                    _windows_at_threshold(usage.get(num), self._models, settings)
+                    and not all_above
+                ):
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
@@ -1896,6 +2085,16 @@ class AutoSwitchEngine:
                             ):
                                 fallback.append(((0, recovery_ts, -h), num))
                             continue
+                elif weekly_first:
+                    # At the threshold, any account that passed the landing
+                    # gate and the caps is a sound landing; the key below
+                    # orders them by weekly reset. No headroom hysteresis: the
+                    # strategy ranks by reset, not by headroom, so a headroom
+                    # margin would contradict its own ordering. The landing
+                    # caps are its margin — without them a target just under
+                    # the line can be taken and re-trigger soon after (a few
+                    # swaps, not a runaway: the no-return bar still applies).
+                    pass
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
                     # only move to accounts whose weekly window resets sooner
@@ -1938,9 +2137,14 @@ class AutoSwitchEngine:
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
-            elif consume_first:
+            elif consume_first or (weekly_first and trigger == "proactive"):
                 # Soonest weekly reset first (unknown resets sort last), most
-                # headroom breaks ties, then sequence order.
+                # headroom breaks ties, then sequence order. For weekly-first
+                # this key is PROACTIVE-ONLY: the at-limit and failover
+                # escapes skip the landing gate, and ranking an escape by
+                # reset would land on the most-consumed account — the exact
+                # failure the caps exist to stop. Escapes rank by headroom.
+                # (consume-first keeps its existing behaviour here; #305/#313.)
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 key = (-h,)
@@ -2058,7 +2262,7 @@ class AutoSwitchEngine:
         # The caller's tick-snapshotted threshold, so one tick fetches and
         # decides on the same value even if apply_threshold() lands mid-tick.
         if threshold is None:
-            threshold = self.settings.threshold
+            threshold = poll_threshold(self.settings)
         escalate = bool(candidates) and (
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
@@ -2119,12 +2323,17 @@ class AutoSwitchEngine:
         # Hold the state lock across the whole recheck -> switch -> record
         # sequence so two concurrent engines (loop + cron --once) make one
         # serialized decision: the loser re-reads the winner's lastSwitchAt
-        # and backs off instead of double-switching. No deadlock cycle: the
-        # switch path (cswap FileLock + Claude Code locks) never takes the
-        # state lock.
+        # and backs off instead of double-switching. Both read their own
+        # config dir's slice, so the dance serializes engines operating the
+        # SAME live config; engines under different CLAUDE_CONFIG_DIRs are
+        # switching different live logins and owe each other no backoff. No
+        # deadlock cycle: the switch path (cswap FileLock + Claude Code
+        # locks) never takes the state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in ("proactive", "consume-first") and self._in_cooldown(
+                self._switch_state(state)
+            ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2139,17 +2348,49 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
 
             state["schemaVersion"] = STATE_SCHEMA_VERSION
-            state["lastSwitchAt"] = self.clock()
-            state["lastSwitchTo"] = number
+            scopes = state.get("perConfigDir")
+            if not isinstance(scopes, dict):
+                scopes = {}
+                state["perConfigDir"] = scopes
+            # Retiring any pre-upgrade top-level copies here IS the
+            # migration — `_switch_state`'s fallback honoured them until this
+            # moment. A switch has always overwritten the entire history
+            # cluster, so when the record was this engine's config's, the
+            # slice write below replaces it exactly as an old-format switch
+            # would have. The record carries no owner, but pre-upgrade
+            # autoswitch ran the DEFAULT profile in the overwhelmingly common
+            # case — so when a non-default engine retires it, the cluster
+            # moves into the default profile's slice (never onto an existing
+            # slice: one a post-upgrade engine already wrote is the newer
+            # authority) instead of vanishing. Wrong only by keeping a
+            # cooldown/bar that wasn't the default profile's — the
+            # over-conservative direction this history's readers already
+            # prefer (see `_no_return_account` on absent keys).
+            legacy = {
+                key: state.pop(key) for key in SWITCH_HISTORY_KEYS if key in state
+            }
+            default_key = normalize_path(get_default_claude_config_home())
+            if (
+                legacy
+                and self._scope_key != default_key
+                and not isinstance(scopes.get(default_key), dict)
+            ):
+                scopes[default_key] = legacy
+            history = scopes.get(self._scope_key)
+            if not isinstance(history, dict):
+                history = {}
+                scopes[self._scope_key] = history
+            history["lastSwitchAt"] = self.clock()
+            history["lastSwitchTo"] = number
             # WHERE we came from, so the next tick can refuse to undo this,
             # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
             # cannot fake. See `_left_account_recovered` for why the present
             # state alone cannot supply one. `inf` is stored as null: it is not
             # portable JSON, and every other reader of this file would have to
             # learn about it.
-            state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
-            state["leftHeadroom"], recovery = left
-            state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
+            history["lastSwitchFrom"] = (result.get("from") or {}).get("number")
+            history["leftHeadroom"], recovery = left
+            history["leftRecoveryAt"] = None if recovery == float("inf") else recovery
             # A `consume-first` phase-2 refetch can write the SAME (None,
             # None) shape a `failover` departure writes, whenever the
             # refetched active row has a `pct` but is otherwise unmeasurable
@@ -2158,7 +2399,7 @@ class AutoSwitchEngine:
             # needs only `resets_at`. Inferring the trigger from the two
             # nulls then runs the wrong legs. Record it directly so the
             # reader never has to guess.
-            state["leftTrigger"] = trigger
+            history["leftTrigger"] = trigger
             atomic_write_json(self.state_path, state)
 
         self._emit(
@@ -2281,7 +2522,9 @@ class AutoSwitchEngine:
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
-        self.switcher.set_poll_policy_inputs(threshold, self._models)
+        self.switcher.set_poll_policy_inputs(
+            poll_threshold(self.settings), self._models
+        )
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds

@@ -183,6 +183,37 @@ class EngineHarness:
             return {}
         return json.loads(path.read_text())
 
+    def switch_state(self) -> dict:
+        """This engine's per-config-dir slice of the switch history.
+
+        `state()` stays the raw file (quarantine, schemaVersion, every
+        scope); assertions about what a switch RECORDED belong here, where
+        the engine itself reads and writes them.
+        """
+        return self.engine._switch_state(self.state())
+
+    def seed_switch_history(self, **keys) -> None:
+        """Write switch-history keys into this engine's own scope slice.
+
+        The top-level spelling (`_mutate_state(lambda s: s.update(...))`)
+        still works through `_switch_state`'s pre-upgrade fallback — but only
+        until a real switch creates the slice, after which top-level keys are
+        invisible to the engine. Tests that seed after a switch, or mix
+        seeding with real switches, must use this instead.
+        """
+        self.mutate_switch_history(lambda history: history.update(keys))
+
+    def mutate_switch_history(self, fn) -> None:
+        """Apply ``fn`` to this engine's scope slice (creating it if absent)."""
+        def apply(state: dict) -> None:
+            fn(
+                state.setdefault("perConfigDir", {}).setdefault(
+                    self.engine._scope_key, {}
+                )
+            )
+
+        self.engine._mutate_state(apply)
+
 
 @pytest.fixture
 def harness(temp_home: Path) -> EngineHarness:
@@ -324,7 +355,7 @@ class TestDecisionTable:
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "proactive"
         assert switch.to_ref == {"number": 3, "email": "c@example.com"}
-        assert harness.state()["lastSwitchTo"] == "3"
+        assert harness.switch_state()["lastSwitchTo"] == "3"
 
     def test_no_active_account(self, temp_home):
         h = EngineHarness(temp_home)
@@ -455,9 +486,7 @@ class TestDecisionTable:
         assert exhausted.earliest_reset_at == reset
 
     def test_cooldown_suppresses_proactive(self, harness):
-        harness.engine._mutate_state(
-            lambda s: s.update(lastSwitchAt=harness.clock() - 10)
-        )
+        harness.seed_switch_history(lastSwitchAt=harness.clock() - 10)
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": _usage(10), "3": _usage(10),
         })
@@ -467,9 +496,7 @@ class TestDecisionTable:
         ]
 
     def test_at_limit_bypasses_cooldown(self, harness):
-        harness.engine._mutate_state(
-            lambda s: s.update(lastSwitchAt=harness.clock() - 10)
-        )
+        harness.seed_switch_history(lastSwitchAt=harness.clock() - 10)
         outcome = harness.tick_with_usage({
             "1": _usage(100), "2": _usage(10), "3": _usage(50),
         })
@@ -479,9 +506,7 @@ class TestDecisionTable:
         assert harness.active_number() == 2
 
     def test_cooldown_expires(self, harness):
-        harness.engine._mutate_state(
-            lambda s: s.update(lastSwitchAt=harness.clock())
-        )
+        harness.seed_switch_history(lastSwitchAt=harness.clock())
         harness.clock.advance(400)  # past the 300s default cooldown
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": _usage(10), "3": _usage(50),
@@ -2804,6 +2829,24 @@ class TestConsumeFirstStrategy:
         assert sw.trigger == "consume-first"
         assert sw.to_ref == {"number": 2, "email": "b@example.com"}
 
+    def test_carried_reset_on_a_zero_pct_account_still_ranks_soonest(self, temp_home):
+        # usage_store._carry_weekly_reset pins a carried-forward resets_at
+        # onto a 0%-utilization weekly window (Anthropic omits resets_at for
+        # some tokens while utilization is 0). Once carried it is an
+        # ordinary resets_at value by the time it reaches the ranking, so
+        # this only pins that consume-first picks the SOONEST reset even
+        # when that account reports 0% usage — not "reset unknown -> last".
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),   # active resets later
+            "2": _usage7(0, 0, _R_SOON),      # 0% but carried reset is soonest
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
     def test_stays_when_active_already_resets_soonest(self, temp_home):
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
@@ -3335,7 +3378,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
             "2": _usage7(10, 10, _R_SOON),
         })
         assert out is TickOutcome.SWITCHED
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state.get("leftTrigger") == "consume-first", (
             f"expected leftTrigger='consume-first', got {state.get('leftTrigger')!r}"
         )
@@ -3352,7 +3395,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
             out = h.tick_with_usage({"1": None, "2": _usage(4)})
             h.clock.advance(60.0)
         assert out is TickOutcome.SWITCHED
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state.get("leftTrigger") == "failover", (
             f"expected leftTrigger='failover', got {state.get('leftTrigger')!r}"
         )
@@ -4157,9 +4200,7 @@ class TestHorizonAxisDoesNotFlap:
         it also emits AllExhaustedEvent — a false claim that reaches the user
         as a macOS notification and a critical TUI row while a peer sits at 0%.
         """
-        harness.engine._mutate_state(
-            lambda st: st.__setitem__("lastSwitchFrom", "2")
-        )
+        harness.seed_switch_history(lastSwitchFrom="2")
         outcome = harness.tick_with_usage({
             "1": _usage(100),      # active, exhausted -> at-limit
             "2": _usage(0),        # the account we left, now at full quota
@@ -4575,12 +4616,12 @@ class TestHorizonAxisDoesNotFlap:
             "3": _usage(92, back["3"]),
         }) is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state["lastSwitchFrom"] == 1 and state["lastSwitchTo"] == "2", (
             f"premise: production writes an int `from` and a str `to` — got "
             f"{state.get('lastSwitchFrom')!r} / {state.get('lastSwitchTo')!r}"
         )
-        h.engine._mutate_state(
+        h.mutate_switch_history(
             lambda st: st.pop("lastSwitchTo", None) if landed is None
             else st.__setitem__("lastSwitchTo", landed)
         )
@@ -4837,7 +4878,7 @@ class TestHorizonAxisDoesNotFlap:
             "3": _usage(99, self._days_out(h, 300)),
         }) is TickOutcome.SWITCHED
         h.clock.advance(301.0)
-        h.engine._mutate_state(lambda st: st.pop("lastSwitchFrom", None))
+        h.mutate_switch_history(lambda st: st.pop("lastSwitchFrom", None))
 
         assert h.tick_with_usage({
             "1": _usage(96.5, self._days_out(h, 10)),
@@ -4890,7 +4931,7 @@ class TestHorizonAxisDoesNotFlap:
         }) is TickOutcome.SWITCHED
         assert h.active_number() == 2
         h.clock.advance(301.0)
-        assert h.engine._read_state().get("lastSwitchFrom") is not None, (
+        assert h.switch_state().get("lastSwitchFrom") is not None, (
             "premise: the move recorded what it left"
         )
 
@@ -4912,7 +4953,7 @@ class TestHorizonAxisDoesNotFlap:
         # ahead of the active by the same margins.
         h.make_live("b@example.com", 2)
         h.clock.advance(301.0)
-        h.engine._mutate_state(lambda st: st.pop("lastSwitchFrom", None))
+        h.mutate_switch_history(lambda st: st.pop("lastSwitchFrom", None))
         assert h.tick_with_usage(second) is TickOutcome.SWITCHED
         assert h.active_number() == 1, (
             "premise: unbarred, the account we left returns soonest and IS the "
@@ -5063,7 +5104,7 @@ class TestHorizonAxisDoesNotFlap:
             "2": _usage7(0.0, 0.0, self._days_out(h, 100)),
         }) is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        assert h.engine._read_state().get("leftHeadroom") == 100.0, (
+        assert h.switch_state().get("leftHeadroom") == 100.0, (
             "premise: consume-first recorded a full-quota departure"
         )
         h.clock.advance(301.0)
@@ -5348,7 +5389,7 @@ class TestHorizonAxisDoesNotFlap:
             "1": _usage(96),                            # 4 pts, NO reset known
             "2": _usage(92, self._days_out(h, 400)),
         }) is TickOutcome.SWITCHED
-        assert h.engine._read_state().get("leftRecoveryAt") is None, (
+        assert h.switch_state().get("leftRecoveryAt") is None, (
             "premise: the departure reset was unknown and stored as null"
         )
         h.clock.advance(3612.0)
@@ -5492,7 +5533,7 @@ class TestHorizonAxisDoesNotFlap:
             h.clock.advance(60.0)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert "leftHeadroom" in state, (
             "premise: _perform writes the keys unconditionally even on failover"
         )
@@ -5599,7 +5640,7 @@ class TestHorizonAxisDoesNotFlap:
             h.clock.advance(60.0)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state.get("leftHeadroom") is None and state.get(
             "leftRecoveryAt"
         ) is None, "premise: a failover snapshot, keys present, values null"
@@ -5668,7 +5709,7 @@ class TestHorizonAxisDoesNotFlap:
             h.clock.advance(60.0)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state.get("leftHeadroom") is None and state.get(
             "leftRecoveryAt"
         ) is None, "premise: a failover snapshot, keys present, values null"
@@ -5726,7 +5767,7 @@ class TestHorizonAxisDoesNotFlap:
             h.clock.advance(60.0)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state.get("leftHeadroom") is None and state.get(
             "leftRecoveryAt"
         ) is None, "premise: a failover snapshot, keys present, values null"
@@ -5939,7 +5980,7 @@ class TestHorizonAxisDoesNotFlap:
                 "2": _usage(10),
             })
         assert outcome is TickOutcome.SWITCHED
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert state.get("leftRecoveryAt") == ranking_now + 100.0, (
             f"leftRecoveryAt={state.get('leftRecoveryAt')!r} -- a SECOND, "
             "independent clock() read after the ranking already decided "
@@ -5981,9 +6022,9 @@ class TestHorizonAxisDoesNotFlap:
 
         # Strip to the pre-upgrade shape: barred is named, no departure
         # evidence recorded at all -- absence releases, by design.
-        h.engine._mutate_state(lambda st: st.pop("leftHeadroom", None))
-        h.engine._mutate_state(lambda st: st.pop("leftRecoveryAt", None))
-        assert "leftHeadroom" not in h.engine._read_state()
+        h.mutate_switch_history(lambda st: st.pop("leftHeadroom", None))
+        h.mutate_switch_history(lambda st: st.pop("leftRecoveryAt", None))
+        assert "leftHeadroom" not in h.switch_state()
 
         h.clock.advance(301.0)
         outcome = h.tick_with_usage({
@@ -6025,7 +6066,7 @@ class TestHorizonAxisDoesNotFlap:
             h.clock.advance(60.0)
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        state = h.engine._read_state()
+        state = h.switch_state()
         assert "leftHeadroom" in state, (
             "premise: _perform writes the keys unconditionally even on failover"
         )
@@ -6894,3 +6935,679 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+class TestSwitchHistoryIsPerConfigDir:
+    """The switch history describes ONE live config, not the machine.
+
+    Engines under different ``CLAUDE_CONFIG_DIR``s operate different live
+    logins: one terminal's switch must not cool another down, bar another's
+    candidates, or overwrite the departure snapshot another's release
+    predicate diffs against. Quarantine is a fact about an ACCOUNT — dead is
+    dead in every terminal — and stays shared. This class pins the move of
+    all six ``SWITCH_HISTORY_KEYS`` from top level into ``perConfigDir``
+    slices keyed by the engine's ``scope_key``, and the pre-upgrade fallback
+    that retires top-level records on the first post-upgrade switch.
+    """
+
+    OTHER = "/somewhere/else/.claude"
+
+    def _tick(self, h: EngineHarness, engine: AutoSwitchEngine, usage: dict):
+        entries = {
+            num: _entry_for(value, h.clock.now) for num, value in usage.items()
+        }
+        with patch.object(
+            h.switcher, "usage_entries_by_account", return_value=entries
+        ):
+            return engine.tick()
+
+    def test_cooldown_gates_only_the_config_dir_that_switched(self, harness):
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+        # Same config dir (a loop and a cron --once on one profile): the
+        # second engine reads the first's lastSwitchAt and backs off.
+        same_scope = harness._make_engine()
+        assert self._tick(harness, same_scope, {
+            "3": _usage(95), "1": _usage(50), "2": _usage(20),
+        }) is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons[-1] == "cooldown"
+
+        # Different config dir: a different live login — no backoff owed.
+        other = harness._make_engine(scope_key=self.OTHER)
+        assert self._tick(harness, other, {
+            "3": _usage(95), "1": _usage(50), "2": _usage(20),
+        }) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_the_bar_does_not_leak_into_another_config_dir(self, temp_home):
+        """INSIDE the recovery horizon, where the bar bites — the same
+        all-spent fleet ``test_the_bar_reaches_the_ranking_through_tick``
+        uses to pin that the OWN engine lands on 3 (its bar refuses the
+        soonest-returning account 1). Past the horizon the bar release and
+        the ranking gate collapse into one inequality and the bar is inert,
+        so a leak there is invisible; here, a foreign engine that saw the
+        own scope's ``lastSwitchFrom=1`` would land on 3 exactly like the
+        owner. Landing on 1 is therefore the observable that the bar did
+        NOT leak."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        days = lambda d: _iso_at(h.clock.now + d * 86400.0)
+        secs = lambda s: _iso_at(h.clock.now + s)
+
+        assert h.tick_with_usage({
+            "1": _usage(92, days(500)),
+            "2": _usage(10, days(400)),
+            "3": _usage(50, days(300)),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.switch_state().get("lastSwitchFrom") == 1, (
+            "premise: the own scope's bar names account 1"
+        )
+        h.clock.advance(301.0)
+
+        other = h._make_engine(scope_key=self.OTHER)
+        assert self._tick(h, other, {
+            "1": _usage(99, secs(1800)),   # the owner's barred account; back first
+            "2": _usage(99, secs(7200)),   # active, spent, back in 2h
+            "3": _usage(99, secs(3600)),   # where a leaked bar would land us
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1, (
+            "the foreign engine avoided account 1 — the no-return bar leaked "
+            "across config dirs"
+        )
+
+    def test_a_foreign_switch_does_not_clobber_the_departure_snapshot(
+        self, harness
+    ):
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+        own = dict(harness.switch_state())
+        assert own.get("leftHeadroom") == 5.0, (
+            "premise: the departure snapshot recorded 1's headroom"
+        )
+        harness.clock.advance(301.0)
+
+        other = harness._make_engine(scope_key=self.OTHER)
+        assert self._tick(harness, other, {
+            "3": _usage(95), "1": _usage(50), "2": _usage(20),
+        }) is TickOutcome.SWITCHED
+
+        assert harness.switch_state() == own, (
+            "a switch in another config dir rewrote this engine's departure "
+            "snapshot — the release predicate now diffs against a baseline "
+            "belonging to a different live config's move"
+        )
+        foreign = harness.state()["perConfigDir"][self.OTHER]
+        assert foreign["lastSwitchTo"] == "2"
+
+    # The six literal key names, spelled out rather than imported: the
+    # production constant is what the retirement loop iterates, so using it
+    # as the oracle here would let the assertion shrink in lockstep with a
+    # shrunk tuple.
+    _HISTORY_KEYS = (
+        "lastSwitchAt",
+        "lastSwitchTo",
+        "lastSwitchFrom",
+        "leftHeadroom",
+        "leftRecoveryAt",
+        "leftTrigger",
+    )
+
+    def test_a_pre_upgrade_record_is_honoured_then_retired(self, harness):
+        # A full record written before perConfigDir existed: all six keys at
+        # top level, with distinguishable sentinel values.
+        harness.engine._mutate_state(
+            lambda s: s.update(
+                lastSwitchAt=harness.clock() - 10,
+                lastSwitchTo="1",
+                lastSwitchFrom="2",
+                leftHeadroom=42.0,
+                leftRecoveryAt=None,
+                leftTrigger="proactive",
+            )
+        )
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.NO_ACTION, (
+            "a pre-upgrade cooldown record must keep its old meaning until "
+            "a switch retires it"
+        )
+        # Pre-migration, the legacy record binds EVERY scope through the
+        # fallback — the faithful reading of the old shared-cluster
+        # semantics, not only the default profile's.
+        other = harness._make_engine(scope_key=self.OTHER)
+        assert self._tick(harness, other, {
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.NO_ACTION
+
+        harness.clock.advance(400.0)
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+
+        raw = harness.state()
+        for key in self._HISTORY_KEYS:
+            assert key not in raw, (
+                f"{key} survived at top level — the first post-upgrade "
+                "switch must retire the pre-upgrade record it replaces"
+            )
+        # The retiring engine IS the default profile here, so its own slice
+        # replaces the record — exactly what an old-format switch's
+        # overwrite did — rather than the record migrating anywhere.
+        slice_ = harness.switch_state()
+        assert slice_["lastSwitchTo"] == "3"
+        assert slice_["lastSwitchFrom"] == 1
+        assert slice_["leftTrigger"] == "proactive"
+        assert slice_["leftHeadroom"] == 5.0
+        assert list(raw["perConfigDir"]) == [harness.engine._scope_key]
+
+    def test_a_foreign_scope_switch_moves_legacy_into_the_default_slice(
+        self, harness
+    ):
+        """The legacy record carries no owner; pre-upgrade autoswitch ran the
+        default profile in the overwhelmingly common case. So when some OTHER
+        config dir's engine performs the retiring switch, the record must
+        move into the default profile's slice — not vanish, which would
+        silently drop the default engine's own cooldown and anti-flap bar for
+        one upgrade cycle. Retirement must also fire even though a slice for
+        a third scope already exists (it is not gated on perConfigDir being
+        absent)."""
+        harness.engine._mutate_state(
+            lambda s: s.update(
+                lastSwitchAt=123.0,
+                lastSwitchTo="9",
+                lastSwitchFrom="8",
+                leftHeadroom=42.0,
+                leftRecoveryAt=None,
+                leftTrigger="failover",
+            )
+        )
+        harness.engine._mutate_state(
+            lambda s: s.setdefault("perConfigDir", {}).update(
+                {"/third/scope": {"lastSwitchAt": 1.0}}
+            )
+        )
+        other = harness._make_engine(scope_key=self.OTHER)
+        assert self._tick(harness, other, {
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+
+        raw = harness.state()
+        for key in self._HISTORY_KEYS:
+            assert key not in raw
+        assert raw["perConfigDir"][harness.engine._scope_key] == {
+            "lastSwitchAt": 123.0,
+            "lastSwitchTo": "9",
+            "lastSwitchFrom": "8",
+            "leftHeadroom": 42.0,
+            "leftRecoveryAt": None,
+            "leftTrigger": "failover",
+        }
+        assert raw["perConfigDir"]["/third/scope"] == {"lastSwitchAt": 1.0}
+        assert raw["perConfigDir"][self.OTHER]["lastSwitchTo"] == "3"
+
+    def test_legacy_never_overwrites_an_existing_default_slice(self, harness):
+        """A slice a post-upgrade engine already wrote is the newer
+        authority; a top-level record next to it can only come from a
+        still-running pre-upgrade writer, and must be dropped, not moved."""
+        harness.seed_switch_history(lastSwitchAt=555.0)  # the default's own
+        harness.engine._mutate_state(
+            lambda s: s.update(lastSwitchAt=123.0, leftHeadroom=42.0)
+        )
+        other = harness._make_engine(scope_key=self.OTHER)
+        assert self._tick(harness, other, {
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+
+        raw = harness.state()
+        default_slice = raw["perConfigDir"][harness.engine._scope_key]
+        assert default_slice["lastSwitchAt"] == 555.0
+        assert "leftHeadroom" not in default_slice
+        assert "lastSwitchAt" not in raw and "leftHeadroom" not in raw
+
+    def test_quarantine_stays_shared_across_config_dirs(self, harness):
+        harness.engine._quarantine("3", "c@example.com", "invalid_grant")
+        other = harness._make_engine(scope_key=self.OTHER)
+        assert self._tick(harness, other, {
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2, (
+            "the foreign engine landed on quarantined account 3 — a dead "
+            "refresh token is dead in every config dir, quarantine must not "
+            "be sliced per scope"
+        )
+
+    def test_a_switch_under_an_arbitrary_config_dir_stays_in_it(
+        self, harness, monkeypatch
+    ):
+        """An engine run under a manually-exported ``CLAUDE_CONFIG_DIR`` (a
+        plain profile dir, NOT one of cswap's own ``sessions/`` dirs, which
+        ``_refuse_session_shell`` blocks by design) switches that profile's
+        live login and leaves the default profile's untouched."""
+        profile = harness.temp_home / "work-profile"
+        profile.mkdir()
+        (profile / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+        (profile / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com", "accountUuid": "uuid-1"},
+        }))
+        default_live = (harness.temp_home / ".claude.json").read_text()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+
+        engine = harness._make_engine()
+        assert self._tick(harness, engine, {
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+
+        landed = json.loads((profile / ".claude.json").read_text())
+        assert landed["oauthAccount"]["emailAddress"] == "c@example.com", (
+            "the switch must land in the exported profile dir"
+        )
+        assert (harness.temp_home / ".claude.json").read_text() == default_live, (
+            "a switch under CLAUDE_CONFIG_DIR rewrote the DEFAULT profile's "
+            "live config"
+        )
+
+    def test_scope_key_follows_claude_config_dir(self, harness, monkeypatch):
+        from claude_swap.mappings import normalize_path
+
+        profile = str(harness.temp_home / "profile-a")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", profile)
+        assert harness._make_engine()._scope_key == normalize_path(profile)
+
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+        assert harness._make_engine()._scope_key == normalize_path(
+            harness.temp_home / ".claude"
+        ), "without CLAUDE_CONFIG_DIR the scope is the default profile"
+
+    def test_equivalent_config_dir_spellings_share_one_slice(
+        self, harness, monkeypatch
+    ):
+        """A cron exporting a trailing-slash (or symlinked) spelling of the
+        profile a shell loop spells canonically must land in the SAME
+        slice, or the two double-switch the same live login — the exact bug
+        class this change fixes. Pinned behaviorally: the second spelling's
+        engine backs off on the first's cooldown."""
+        profile = harness.temp_home / "profile-a"
+        profile.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        canonical = harness._make_engine()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile) + "/")
+        slashed = harness._make_engine()
+        link = harness.temp_home / "profile-link"
+        link.symlink_to(profile)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(link))
+        linked = harness._make_engine()
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+        assert canonical._scope_key == slashed._scope_key == linked._scope_key
+
+        # The spelling only ever feeds the scope key (fixed at
+        # construction); the live login these ticks read is the harness's
+        # default profile.
+        assert self._tick(harness, canonical, {
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+        assert self._tick(harness, slashed, {
+            "3": _usage(95), "1": _usage(50), "2": _usage(20),
+        }) is TickOutcome.NO_ACTION, (
+            "the trailing-slash spelling resolved to a different slice — no "
+            "cooldown honoured between two engines on one profile"
+        )
+
+    def test_a_corrupt_perconfigdir_falls_back_and_is_rebuilt(self, harness):
+        harness.engine._mutate_state(lambda s: s.update(perConfigDir="oops"))
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED  # reader falls back cleanly, no crash
+        raw = harness.state()
+        assert (
+            raw["perConfigDir"][harness.engine._scope_key]["lastSwitchTo"]
+            == "3"
+        )
+
+    def test_a_corrupt_slice_is_replaced_and_siblings_survive(self, harness):
+        harness.engine._mutate_state(
+            lambda s: s.update(perConfigDir={
+                harness.engine._scope_key: "oops",
+                "/sibling": {"lastSwitchAt": 1.0},
+            })
+        )
+        assert harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        }) is TickOutcome.SWITCHED
+        raw = harness.state()
+        assert (
+            raw["perConfigDir"][harness.engine._scope_key]["lastSwitchTo"]
+            == "3"
+        )
+        assert raw["perConfigDir"]["/sibling"] == {"lastSwitchAt": 1.0}
+
+
+
+# --- weekly-first strategy, per-window thresholds, landing caps ---------------
+
+
+def _seed3(h: EngineHarness) -> EngineHarness:
+    h.seed(1, "a@example.com")
+    h.seed(2, "b@example.com")
+    h.seed(3, "c@example.com")
+    h.make_live("a@example.com", 1)
+    return h
+
+
+def _no_switch_reasons(h: EngineHarness) -> list[str]:
+    return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+
+class TestWeeklyFirstStrategy:
+    """`weekly-first` = consume-first's target choice with `best`'s trigger.
+
+    It ranks candidates by soonest weekly reset, but never moves while the
+    active account is below the threshold.
+    """
+
+    def test_below_threshold_stays_even_when_a_peer_resets_sooner(self, temp_home):
+        h = _seed3(EngineHarness(temp_home, strategy="weekly-first"))
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),    # active, healthy
+            "2": _usage7(10, 10, _R_SOON),     # resets sooner — consume-first would move
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert _no_switch_reasons(h) == ["below-threshold"]
+
+    def test_at_threshold_picks_soonest_weekly_reset_not_most_headroom(self, temp_home):
+        h = _seed3(EngineHarness(temp_home, strategy="weekly-first"))
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),    # active, over the 90 threshold
+            "2": _usage7(50, 40, _R_SOON),     # less headroom, resets soonest
+            "3": _usage7(10, 10, _R_LATEST),   # most headroom, resets latest
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_unknown_weekly_reset_sorts_last(self, temp_home):
+        h = _seed3(EngineHarness(temp_home, strategy="weekly-first"))
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20, _R_LATER),
+            "2": _usage7(10, 10),              # no resets_at on the weekly window
+            "3": _usage7(50, 40, _R_LATEST),   # known reset beats unknown
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_at_limit_escape_ranks_by_headroom_not_reset(self, temp_home):
+        """The at-limit escape skips the landing gate. Ranking it by weekly
+        reset would land on the most-consumed account — with no caps set,
+        a 1-point account over a 95-point one. Escapes rank by headroom."""
+        h = _seed3(EngineHarness(temp_home, strategy="weekly-first"))
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 20, _R_LATER),   # active, at its limit
+            "2": _usage7(99, 10, _R_SOON),     # soonest weekly reset, 1 pt left
+            "3": _usage7(5, 10, _R_LATEST),    # 95 pts
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_no_hysteresis_needed_to_leave_at_threshold(self, temp_home):
+        """`best` refuses a target that does not beat the active account by
+        `hysteresis_pct`. weekly-first does not: the landing gate already
+        keeps the target under the threshold, so the two cannot flap."""
+        h = _seed3(EngineHarness(temp_home, strategy="weekly-first", hysteresis_pct=10))
+        outcome = h.tick_with_usage({
+            "1": _usage7(91, 20, _R_LATER),    # 9 pts headroom
+            "2": _usage7(85, 40, _R_SOON),     # 15 pts: only 6 better than active
+            "3": _usage7(85, 40, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+
+class TestLandingCaps:
+    """`landingMax5hPct` / `landingMax7dPct`: never switch ONTO an account
+    whose own 5h or 7d window is above the cap. Every trigger, every strategy.
+    """
+
+    def test_five_hour_cap_skips_the_soonest_reset(self, temp_home):
+        """Threshold 99 so #2 (5h 92) passes the landing gate on its own;
+        only the cap keeps it out. Without the cap this tick picks #2."""
+        h = _seed3(EngineHarness(
+            temp_home, strategy="weekly-first", threshold=99, landing_max_5h_pct=90
+        ))
+        outcome = h.tick_with_usage({
+            "1": _usage7(99, 20, _R_LATER),
+            "2": _usage7(92, 10, _R_SOON),     # soonest, under the line, over the cap
+            "3": _usage7(10, 10, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_seven_day_cap_is_judged_on_the_weekly_window_itself(self, temp_home):
+        """Headroom is `100 - max(5h, 7d)`, so a 0% 5h / 96% 7d account and a
+        96% 5h / 0% 7d account look identical to `best`. The cap reads the
+        weekly window on its own."""
+        h = _seed3(EngineHarness(
+            temp_home, strategy="weekly-first", threshold=99, landing_max_7d_pct=95
+        ))
+        outcome = h.tick_with_usage({
+            "1": _usage7(99, 20, _R_LATER),
+            "2": _usage7(0, 96, _R_SOON),      # weekly over the cap
+            "3": _usage7(0, 50, _R_LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_caps_hold_on_the_at_limit_escape(self, temp_home):
+        """The escape used to accept any headroom above zero. With a cap set,
+        an account over it is not a landing even when the active account is
+        hard-blocked: with nowhere allowed to go, the tick is BLOCKED and the
+        engine waits for a reset instead of moving the 429 to another account.
+        """
+        h = EngineHarness(temp_home, strategy="best", landing_max_5h_pct=90)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 20, _R_LATER),   # at its limit
+            "2": _usage7(95, 10, _R_SOON),     # 5 pts left, over the cap
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    def test_caps_apply_under_best_too(self, temp_home):
+        """The caps are not a weekly-first feature. Under `best`, the only
+        candidate clears the threshold gate AND the 10-point hysteresis
+        (20 pts vs the active's 5), so only the cap can refuse it."""
+        h = EngineHarness(temp_home, strategy="best", landing_max_5h_pct=75)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 20),
+            "2": _usage7(80, 5),               # legal landing by every other rule
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        blocked = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "1 candidate(s) over the landing caps" in blocked[-1].detail
+
+    def test_cap_off_by_default(self, temp_home):
+        """100 = no cap: a 96% account is still a legal at-limit landing, as
+        it was before the setting existed."""
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 20),
+            "2": _usage7(96, 10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+
+    def test_failover_is_exempt_from_the_caps(self, temp_home):
+        """When the active account's usage cannot be read at all, waiting
+        for its reset is not an option — there is no reset to wait for. So
+        failover takes any account with headroom, cap or no cap."""
+        h = EngineHarness(temp_home, strategy="best", landing_max_5h_pct=90)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcomes = []
+        for _ in range(4):                    # unhealthy_ticks (3) then failover
+            outcomes.append(h.tick_with_usage({
+                "1": None,                    # unreadable
+                "2": _usage7(91, 5),          # over the cap
+            }))
+            h.clock.advance(60)
+        assert TickOutcome.SWITCHED in outcomes, outcomes
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+
+    def test_seven_day_cap_covers_named_per_model_windows(self, temp_home):
+        """With `model: Fable`, a candidate whose Fable weekly window is at
+        99% is over the 7d cap even though its account-wide windows are low.
+        The other candidate, clean on every window, is taken instead."""
+        h = EngineHarness(
+            temp_home, strategy="best", model="Fable",
+            landing_max_5h_pct=90, landing_max_7d_pct=90,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        spent_fable = {
+            "five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0},
+            "scoped": [{"name": "Fable", "pct": 99.0}],
+        }
+        clean = {
+            "five_hour": {"pct": 30.0}, "seven_day": {"pct": 30.0},
+            "scoped": [{"name": "Fable", "pct": 30.0}],
+        }
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 20),            # at its limit
+            "2": spent_fable,                 # more headroom on 5h/7d, Fable spent
+            "3": clean,
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+
+class TestPerWindowThresholds:
+    """`threshold5h` / `threshold7d` override `threshold` for that one window.
+    A switch fires when ANY window reaches its own line."""
+
+    def test_five_hour_override_fires_before_the_account_wide_threshold(self, temp_home):
+        h = _seed3(EngineHarness(temp_home, threshold=99, threshold_5h=95))
+        outcome = h.tick_with_usage({
+            "1": _usage7(96, 20),              # 5h over its 95 line; 7d fine
+            "2": _usage7(10, 10),
+            "3": _usage7(20, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+
+    def test_weekly_window_still_follows_the_account_wide_threshold(self, temp_home):
+        h = _seed3(EngineHarness(temp_home, threshold=99, threshold_5h=95))
+        outcome = h.tick_with_usage({
+            "1": _usage7(50, 96),              # 7d at 96 < 99: no override for it
+            "2": _usage7(10, 10),
+            "3": _usage7(20, 20),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons[0].reason == "below-threshold"
+        assert reasons[0].detail == "96% < 99%"
+
+    def test_weekly_override_lets_the_weekly_window_run_closer_to_the_wall(self, temp_home):
+        h = _seed3(EngineHarness(temp_home, threshold=95, threshold_7d=99))
+        assert h.tick_with_usage({
+            "1": _usage7(50, 97),              # would trip a flat 95; not the 99 override
+            "2": _usage7(10, 10),
+            "3": _usage7(20, 20),
+        }) is TickOutcome.NO_ACTION
+        h.events.clear()
+        assert h.tick_with_usage({
+            "1": _usage7(50, 99),
+            "2": _usage7(10, 10),
+            "3": _usage7(20, 20),
+        }) is TickOutcome.SWITCHED
+
+    def test_landing_gate_uses_the_same_per_window_lines(self, temp_home):
+        """A target is refused if ANY of its windows is at its own threshold
+        (it would re-trigger next tick). With a weekly override at 99, a
+        candidate at 97% weekly is a legal landing even though the
+        account-wide threshold is 95. (Under `best` the hysteresis margin
+        would still refuse a 3-point candidate; weekly-first has no such
+        margin, which is the strategy this override is for.)"""
+        h = EngineHarness(
+            temp_home, strategy="weekly-first", threshold=95, threshold_7d=99
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(96, 20),
+            "2": _usage7(10, 97),              # weekly 97: under 99, legal
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_without_the_override_that_landing_is_refused(self, temp_home):
+        h = EngineHarness(temp_home, strategy="weekly-first", threshold=95)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(96, 20),
+            "2": _usage7(10, 97),              # weekly 97 >= 95: would re-trigger
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_below_threshold_detail_names_the_window_closest_to_firing(self, temp_home):
+        """5h at 93 against a 95 line is 2 points from switching; 7d at 96
+        against a 99 line is 3 away. The report must name the 5h window,
+        not the higher percentage."""
+        h = _seed3(EngineHarness(temp_home, threshold=99, threshold_5h=95))
+        outcome = h.tick_with_usage({
+            "1": _usage7(93, 96),
+            "2": _usage7(10, 10),
+            "3": _usage7(20, 20),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        held = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert held[0].detail == "93% < 95%"
+
+    def test_switcher_settings_fallback_plans_on_the_lowest_line(self, temp_home):
+        """Surfaces without a hosted engine (cswap list, the menu bar) read
+        the settings file for their poll plan. They must tighten toward the
+        same line the engine does, or they write a slacker cadence into the
+        shared store."""
+        from claude_swap.settings import set_setting
+
+        h = _seed3(EngineHarness(temp_home))
+        h.switcher.clear_poll_policy_inputs()
+        set_setting(h.switcher.backup_dir, "autoswitch.threshold", "99")
+        set_setting(h.switcher.backup_dir, "autoswitch.threshold5h", "95")
+        threshold, _models = h.switcher._poll_policy_inputs()
+        assert threshold == 95.0
+
+    def test_poll_planner_watches_the_lowest_line(self, temp_home):
+        from claude_swap.settings import poll_threshold
+
+        assert poll_threshold(AutoSwitchSettings(threshold=99)) == 99
+        assert poll_threshold(AutoSwitchSettings(threshold=99, threshold_5h=95)) == 95
+        assert poll_threshold(AutoSwitchSettings(threshold=90, threshold_7d=99)) == 90

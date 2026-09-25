@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
+from datetime import date
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
@@ -60,6 +62,7 @@ _SUBCOMMAND_FLAGS = {
     "enable": "--enable-account",
     "export": "--export",
     "import": "--import",
+    "import-usage": "--import-usage",
     "purge": "--purge",
     "upgrade": "--upgrade",
     "update": "--upgrade",
@@ -131,6 +134,7 @@ Examples:
   cswap run user@example.com
   cswap run 2 --no-share
   cswap run 2 --share-history
+  cswap run 2 --share-plugins
   cswap run 2 --require-session
   cswap run 2 -- --resume
         """,
@@ -164,6 +168,20 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--share-plugins",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Share the plugin store (plugins/) from ~/.claude into the "
+            "session profile, so a plugin installed or updated in any "
+            "account is available in all of them. Plugins the profile "
+            "already accumulated are merged into ~/.claude first (existing "
+            "source entries win). --no-share-plugins reverts to a "
+            "per-account store, re-installing on demand — already-merged "
+            "plugins stay in ~/.claude. Not supported on Windows."
+        ),
+    )
+    parser.add_argument(
         "--require-session",
         action="store_true",
         help=(
@@ -193,6 +211,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                share_plugins=args.share_plugins,
                 require_session=args.require_session,
             )
             return  # only reachable in tests where exec/exit is mocked
@@ -205,6 +224,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                share_plugins=args.share_plugins,
                 require_session=args.require_session,
             )
             return  # only reachable in tests
@@ -400,6 +420,54 @@ def _unclaimed_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _statusline_command(argv: list[str]) -> None:
+    """Handle `cswap statusline` — print the active account for a status line.
+
+    Made to drop into Claude Code's ``statusLine.command`` (or any shell
+    prompt): it prints one short line naming the account cswap's live login is
+    on, so which account a session uses is always visible. Reads only local
+    state, never the network, and never exits non-zero on the render path — a
+    status line must not slow down or break the host prompt.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} statusline",
+        description=(
+            "Print the active Claude account, for a shell or Claude Code "
+            "status line."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Add to Claude Code's settings.json:
+  "statusLine": { "type": "command", "command": "cswap statusline" }
+        """,
+    )
+    parser.add_argument(
+        "--email",
+        action="store_true",
+        help="Show the full email instead of the alias / email local-part",
+    )
+    parser.add_argument(
+        "--icon",
+        metavar="ICON",
+        default="⇄",
+        help="Leading icon (default: ⇄)",
+    )
+    parser.add_argument(
+        "--no-icon", action="store_true", help="Omit the leading icon"
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        email, alias = ClaudeAccountSwitcher().active_account_display()
+    except Exception:
+        return  # never break the host status line
+    if not email:
+        return  # no live login — print nothing
+    label = email if args.email else (alias or email.split("@", 1)[0])
+    prefix = "" if args.no_icon else f"{args.icon} "
+    print(f"{prefix}{label}")
+
+
 def _swap_command(argv: list[str]) -> None:
     """Handle `cswap swap NUM|EMAIL|ALIAS NUM|EMAIL|ALIAS`.
 
@@ -573,6 +641,85 @@ Examples:
         sys.exit(130)
 
 
+def _expires_command(argv: list[str]) -> None:
+    """Handle `cswap expires [NUM|EMAIL] [YYYY-MM-DD] [--clear]`.
+
+    Records (or, with --clear, removes) the date an account's underlying
+    subscription is canceled/expires — a fact cswap cannot observe on its own
+    (the usage API reports only 5h/7d rate-limit windows, never billing
+    state). Feeds `cswap switch --strategy expiring` and the expiration line
+    in `cswap list`. With no arguments, lists every recorded expiration.
+    Pre-dispatched before the main parser for the same reason as `alias`.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap expires",
+        description=(
+            "Record, clear, or list when an account's subscription is "
+            "canceled/expires, so `cswap switch --strategy expiring` can "
+            "drain the soonest-expiring account first."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap expires 2 2026-09-16
+  cswap expires user@example.com 2026-09-16
+  cswap expires 2 --clear
+  cswap expires                       # list all recorded expirations
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to set an expiration on. Omit to list all recorded expirations.",
+    )
+    parser.add_argument(
+        "date",
+        nargs="?",
+        metavar="YYYY-MM-DD",
+        help="Date the account's subscription is canceled/expires.",
+    )
+    parser.add_argument("--clear", action="store_true", help="Remove the account's recorded expiration")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.clear and args.date:
+        parser.error("--clear does not take a YYYY-MM-DD argument")
+    if args.clear and args.account is None:
+        parser.error("NUM|EMAIL is required with --clear")
+    if args.account is not None and not args.clear and not args.date:
+        # `cswap expires 2026-09-16` — the date landed in the account slot.
+        try:
+            date.fromisoformat(args.account)
+        except ValueError:
+            parser.error("YYYY-MM-DD is required (or pass --clear to remove the expiration)")
+        parser.error("NUM|EMAIL is required before the date")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.account is None:
+            rows = switcher.list_expirations()
+            if not rows:
+                print(dimmed("No expirations recorded"))
+                return
+            print(bolded("Expirations:"))
+            today = date.today()
+            for num, expires, email in rows:
+                lapsed = " (lapsed)" if date.fromisoformat(expires) < today else ""
+                print(f"  {num}: {expires}{lapsed} {muted(f'({email})')}")
+            return
+
+        switcher.set_account_expires(args.account, None if args.clear else args.date)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -606,6 +753,7 @@ Examples:
   cswap auto --threshold 80        # switch earlier
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
+  cswap auto --notify              # desktop notification on switch/exhaustion
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
 
@@ -664,18 +812,29 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "weekly-first"),
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left; default), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest)"
+            "resets soonest) or 'weekly-first' (same target, but only once "
+            "the active account reaches the threshold)"
         ),
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Evaluate and report, but never switch or write state",
+    )
+    parser.add_argument(
+        "--notify",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Send a desktop notification when the engine switches accounts, "
+            "quarantines one, or finds all exhausted (default: off; the "
+            "menu bar already notifies on its own)"
+        ),
     )
     parser.add_argument(
         "--debug",
@@ -710,10 +869,15 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        emit = jsonl_emit if args.json else human_emit
+        if settings.notify:
+            from claude_swap.notifications import make_notifying_emit
+
+            emit = make_notifying_emit(emit)
         engine = AutoSwitchEngine(
             switcher,
             settings,
-            jsonl_emit if args.json else human_emit,
+            emit,
             dry_run=args.dry_run,
         )
 
@@ -1011,11 +1175,17 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] == "expires":
+        _expires_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
     if argv and argv[0] == "move":
         _move_command(argv[1:])
+        return
+    if argv and argv[0] == "statusline":
+        _statusline_command(argv[1:])
         return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
@@ -1053,6 +1223,9 @@ Commands:
   %(prog)s alias <num|email> <name>   set a short alias for an account
   %(prog)s alias <num|email> --unset  remove an account's alias
   %(prog)s alias                      list all aliases
+  %(prog)s expires <num|email> <date> record when an account's sub is canceled
+  %(prog)s expires <num|email> --clear remove a recorded expiration
+  %(prog)s expires                    list all recorded expirations
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
@@ -1060,10 +1233,12 @@ Commands:
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
+  %(prog)s import-usage <path>        adopt usage another machine read (list --json)
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
+  %(prog)s statusline                 print the active account for a status line
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 
@@ -1072,9 +1247,11 @@ Aliases: ls=list  rm=remove  update=upgrade""",
         epilog="""Flags combine with subcommands:
   %(prog)s switch --strategy best           # pick the account with most quota left
   %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
+  %(prog)s switch --strategy expiring       # drain the soonest-expiring account
   %(prog)s switch user@example.com
   %(prog)s list --token-status
   %(prog)s list --json
+  %(prog)s import-usage usage.json --hold 600  # adopt another machine's list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
@@ -1111,12 +1288,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     )
     parser.add_argument(
         "--strategy",
-        choices=["best", "next-available"],
-        metavar="{best,next-available}",
+        choices=["best", "next-available", "expiring"],
+        metavar="{best,next-available,expiring}",
         help=(
-            "With bare 'switch': pick the target by remaining 5h/7d quota. "
-            "'best' jumps to the account with the most headroom; "
-            "'next-available' rotates to the next account, skipping any at their limit"
+            "With bare 'switch': pick the target by remaining 5h/7d quota, or "
+            "by recorded subscription expiration. 'best' jumps to the account "
+            "with the most headroom; 'next-available' rotates to the next "
+            "account, skipping any at their limit; 'expiring' jumps to the "
+            "soonest-expiring account (see 'cswap expires') among those with "
+            "headroom right now"
         ),
     )
     parser.add_argument(
@@ -1167,6 +1347,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         "--full",
         action="store_true",
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
+    )
+    parser.add_argument(
+        "--hold",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "With 'import-usage': keep this machine from fetching the "
+            "imported accounts for this many seconds"
+        ),
     )
     parser.add_argument(
         "--install-service",
@@ -1254,6 +1443,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--import-usage",
+        metavar="PATH",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--tui",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1303,9 +1497,28 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.switch_to is not None
         or args.export is not None
         or args.import_ is not None
+        or args.import_usage is not None
         or args.add_token is not None
     ):
         parser.error("no command given — try '%(prog)s help'" % {"prog": _prog_name()})
+
+    # An empty value satisfies the guard above (the option *is* set) but matches
+    # no truthiness-tested branch of the dispatch chain below, so cswap would
+    # fall out of it and exit 0 having done nothing: `cswap export "$DEST"` with
+    # an unset DEST must not look like a completed backup. Rejected here, ahead
+    # of the modifier guards, so the error names the empty value instead of
+    # blaming an --account/--force/--full that was used correctly. --add-token is
+    # exempt: its const="" means "prompt me for the token".
+    for subcommand, metavar, value in (
+        ("remove", "NUM|EMAIL", args.remove_account),
+        ("disable", "NUM|EMAIL", args.disable_account),
+        ("enable", "NUM|EMAIL", args.enable_account),
+        ("switch", "NUM|EMAIL", args.switch_to),
+        ("export", "PATH", args.export),
+        ("import", "PATH", args.import_),
+    ):
+        if value is not None and not value:
+            parser.error(f"'{subcommand}' requires a non-empty {metavar}")
 
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
@@ -1325,8 +1538,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         # Meaningless on a direct-target switch or plain rotation — nothing
         # usage-aware reads it there, so reject loudly rather than ignore.
         parser.error(
-            "--model can only be used with 'switch --strategy best' or "
-            "'switch --strategy next-available'"
+            "--model can only be used with 'switch --strategy best', "
+            "'switch --strategy next-available', or 'switch --strategy expiring'"
         )
 
     if args.slot is not None and not (args.add_account or args.add_token is not None):
@@ -1346,6 +1559,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
+
+    if args.hold is not None and args.import_usage is None:
+        parser.error("--hold can only be used with 'import-usage'")
+
+    if args.hold is not None and not (math.isfinite(args.hold) and args.hold >= 0):
+        parser.error("--hold must be a non-negative number of seconds")
 
     if (
         args.install_service or args.uninstall_service or args.service_status
@@ -1439,6 +1658,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             from claude_swap.transfer import import_accounts
 
             import_accounts(switcher, args.import_, force=args.force)
+        elif args.import_usage:
+            from claude_swap.transfer import import_usage
+
+            import_usage(switcher, args.import_usage, hold_s=args.hold or 0.0)
         elif args.tui:
             from claude_swap.tui import run as tui_run
 

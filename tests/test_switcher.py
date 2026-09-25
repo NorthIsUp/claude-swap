@@ -28,6 +28,7 @@ from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.session import mark_session_stale
+from claude_swap.settings import set_setting
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
@@ -415,6 +416,40 @@ class TestAliasCommand:
         assert normalized == "dev"
         data = switcher._get_sequence_data()
         assert data["accounts"]["2"]["alias"] == "dev"
+
+    def test_set_alias_preserve_case_keeps_typed_spelling(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        _, stored = switcher.set_alias("2", "DevBox", preserve_case=True)
+
+        assert stored == "DevBox"
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["alias"] == "DevBox"
+
+    def test_preserved_case_alias_still_resolves_case_insensitively(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A capitalized alias must stay usable as an identifier in any case."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher.set_alias("2", "DevBox", preserve_case=True)
+
+        for spelling in ("devbox", "DEVBOX", "DevBox"):
+            assert switcher._resolve_account_identifier(spelling) == "2"
+
+    def test_set_alias_preserve_case_still_rejects_duplicates(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Uniqueness is case-insensitive, so case alone can't dodge a clash."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher.set_alias("1", "dev")
+
+        with pytest.raises(ConfigError):
+            switcher.set_alias("2", "DEV", preserve_case=True)
 
     def test_set_alias_by_email(self, temp_home: Path, sample_sequence_data: dict):
         switcher = ClaudeAccountSwitcher()
@@ -5143,6 +5178,73 @@ class TestAddAccountFromToken:
         assert "1" not in data["accounts"]
         assert 7 in data["sequence"]
 
+    def test_slot_refresh_preserves_alias_and_disabled(self, temp_home):
+        """Re-running `add-token --slot N` when that slot's token expires is a
+        refresh of the same account, so the alias and the park the user set on
+        the slot must outlive the old token."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v1", slot=3)
+
+        switcher.set_alias("3", "ci")
+        switcher.set_account_disabled("3", True)
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v2", slot=3)
+
+        record = switcher._get_sequence_data()["accounts"]["3"]
+        assert record.get("alias") == "ci"
+        assert record.get("disabled") is True
+
+    def test_slot_migration_preserves_alias_and_disabled(self, temp_home):
+        """Moving a token account to another slot with --slot carries its
+        alias and its disabled flag along with it."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v1", slot=3)
+
+        email = switcher._get_sequence_data()["accounts"]["3"]["email"]
+        switcher.set_alias("3", "ci")
+        switcher.set_account_disabled("3", True)
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"), \
+             patch.object(switcher, "_delete_account_files"):
+            switcher.add_account_from_token("token-v1", email, slot=6)
+
+        data = switcher._get_sequence_data()
+        assert "3" not in data["accounts"]
+        assert data["accounts"]["6"].get("alias") == "ci"
+        assert data["accounts"]["6"].get("disabled") is True
+
+    def test_displacing_a_different_account_does_not_inherit_its_state(
+        self, temp_home,
+    ):
+        """Overwriting an occupied slot ends that slot's lineage; the new
+        account must not pick up the displaced one's alias or park."""
+        switcher = self._make_switcher(temp_home)
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"):
+            switcher.add_account_from_token("token-v1", "old@example.com", slot=4)
+
+        switcher.set_alias("4", "ci")
+        switcher.set_account_disabled("4", True)
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_write_account_config"), \
+             patch.object(switcher, "_delete_account_files"):
+            switcher.add_account_from_token(
+                "token-v2", "new@example.com", slot=4, assume_yes=True,
+            )
+
+        record = switcher._get_sequence_data()["accounts"]["4"]
+        assert record["email"] == "new@example.com"
+        assert "alias" not in record
+        assert "disabled" not in record
+
     def test_update_in_place_same_email(self, temp_home, capsys):
         """Calling add_account_from_token again for the same email refreshes in place."""
         switcher = self._make_switcher(temp_home)
@@ -6537,6 +6639,15 @@ class TestMacosKeychainFallback:
         s._backup_enc_path("1", "a@example.com").write_text(bad)
         assert s._read_account_credentials("1", "a@example.com") == "FROM-KC"
 
+    def test_backup_non_utf8_enc_falls_back_to_keychain(
+        self, temp_home: Path, block_real_keychain
+    ):
+        """A garbled .enc is garbled whatever its bytes decode to."""
+        s = self._macos_switcher()
+        s._kc_write_backup("1", "a@example.com", "FROM-KC")
+        s._backup_enc_path("1", "a@example.com").write_bytes(b"\xff\xfegarbled")
+        assert s._read_account_credentials("1", "a@example.com") == "FROM-KC"
+
     def test_backup_delete_removes_both_backends(
         self, temp_home: Path, block_real_keychain
     ):
@@ -7453,6 +7564,29 @@ class TestProvenanceGuard:
                 p.stop()
         assert creds_store[("1", "test@example.com")] == "sk-ant-api03-new"
 
+    def test_mcp_only_live_never_overwrites_an_api_key_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """An API-key slot's live read becomes an mcpOAuth-only blob once
+        Claude Code re-auths an MCP server; backing that up destroyed the
+        slot's only copy of the key."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = "sk-ant-api03-key"
+        live_state = {"creds": json.dumps({"mcpOAuth": {
+            "some-server|abc123": {"serverName": "some-server"},
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == "sk-ant-api03-key"
+
     def test_moved_bytes_between_prefetch_and_lock_fall_to_unresolved(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
@@ -7696,11 +7830,45 @@ class TestLockstepUsageDetection:
         assert "Account-1 and Account-2" in warnings[0]
         assert "may be the same account" in warnings[0]
 
+    def test_subsecond_reset_jitter_still_flagged(
+        self, temp_home, sample_sequence_data,
+    ):
+        """Issue #161: the two slots are fetched a fraction of a second
+        apart, so the API hands back the same window boundary with a
+        different sub-second component. The timestamps below are the pair
+        the reporter observed."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        entries = {
+            "1": self._entry(
+                25.0, "2026-07-25T09:00:00.129393+00:00",
+                60.0, "2026-07-28T00:00:00.101000+00:00",
+            ),
+            "2": self._entry(
+                25.0, "2026-07-25T09:00:00.340384+00:00",
+                60.0, "2026-07-28T00:00:00.902000+00:00",
+            ),
+        }
+        warnings = switcher._lockstep_usage_warnings(self._info(), entries)
+        assert len(warnings) == 1
+        assert "Account-1 and Account-2" in warnings[0]
+
     def test_differing_resets_not_flagged(self, temp_home, sample_sequence_data):
         switcher = self._switcher(temp_home, sample_sequence_data)
         entries = {
             "1": self._entry(25.0, "2026-07-10T12:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
             "2": self._entry(25.0, "2026-07-10T13:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
+        }
+        assert switcher._lockstep_usage_warnings(self._info(), entries) == []
+
+    def test_resets_a_minute_apart_not_flagged(
+        self, temp_home, sample_sequence_data,
+    ):
+        """The tolerance absorbs fetch skew, nothing more: two accounts whose
+        5h windows opened a minute apart are still two accounts."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        entries = {
+            "1": self._entry(25.0, "2026-07-10T12:00:00Z", 60.0, "2026-07-14T00:00:00Z"),
+            "2": self._entry(25.0, "2026-07-10T12:01:00Z", 60.0, "2026-07-14T00:00:00Z"),
         }
         assert switcher._lockstep_usage_warnings(self._info(), entries) == []
 
@@ -8201,6 +8369,93 @@ class TestSharedOAuthCredentialPreservation:
 
         assert composed == {"claudeAiOauth": {"accessToken": "target"}}
 
+    def test_design_login_travels_with_the_slot_by_default(self, temp_home):
+        # designOauth is account-bound like trustedDeviceToken: at the
+        # swap.designLogin default the target slot's own copy activates.
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "designOauth": {"refreshToken": "design-target"},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "designOauth": {"refreshToken": "design-live"},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {
+            "claudeAiOauth": {"accessToken": "target"},
+            "designOauth": {"refreshToken": "design-target"},
+        }
+
+    def test_unswapped_design_login_stays_live(self, temp_home):
+        # With swap.designLogin off one /design-login serves every account:
+        # the live credential wins over the slot's snapshot, which may hold a
+        # generation Claude Code has since rotated or revoked.
+        switcher = ClaudeAccountSwitcher()
+        set_setting(switcher.backup_dir, "swap.designLogin", "false")
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "designOauth": {"refreshToken": "design-stale"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "designOauth": {"refreshToken": "design-current"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {
+            "claudeAiOauth": {"accessToken": "target"},
+            "designOauth": {"refreshToken": "design-current"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }
+
+    def test_unswapped_design_login_absent_from_live_is_not_resurrected(
+        self, temp_home
+    ):
+        # Claude Code revokes and deletes designOauth on /login and /logout;
+        # the slot's copy of that revoked grant must not come back.
+        switcher = ClaudeAccountSwitcher()
+        set_setting(switcher.backup_dir, "swap.designLogin", "false")
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "designOauth": {"refreshToken": "design-revoked"},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {"claudeAiOauth": {"accessToken": "target"}}
+
+    def test_unswapped_design_login_without_live_oauth_activates_verbatim(
+        self, temp_home
+    ):
+        # No live OAuth object to compose from (a managed API key is active):
+        # the slot's own copy activates, as it does for every shared key.
+        switcher = ClaudeAccountSwitcher()
+        set_setting(switcher.backup_dir, "swap.designLogin", "false")
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "designOauth": {"refreshToken": "design-target"},
+        })
+
+        assert (
+            switcher._prepare_credentials_for_activation(target, self.API_KEY)
+            == target
+        )
+
     def test_direct_activation_without_config_identity_composes_live_state(
         self, temp_home
     ):
@@ -8343,6 +8598,43 @@ class TestSharedOAuthCredentialPreservation:
             "server": {"refreshToken": "current"}
         }
 
+    def test_normal_switch_keeps_an_unswapped_design_login(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        set_setting(get_backup_root(), "swap.designLogin", "false")
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+            },
+            "designOauth": {"refreshToken": "design-current"},
+        })
+        target = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-target-2", "refreshToken": "rt-target-2",
+            },
+            "designOauth": {"refreshToken": "design-stale"},
+        })
+        creds_store[("1", "test@example.com")] = live
+        creds_store[("2", "account2@example.com")] = target
+        live_state = {"creds": live}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                switcher._perform_switch("2", emit_output=False)
+        finally:
+            for p in patches:
+                p.stop()
+
+        activated = json.loads(live_state["creds"])
+        assert activated["claudeAiOauth"]["accessToken"] == "sk-target-2"
+        assert activated["designOauth"] == {"refreshToken": "design-current"}
+
     def test_direct_activation_preserves_live_shared_state(self, temp_home):
         switcher, _ = TestDirectActivationPreservation()._setup(temp_home)
         live_path = temp_home / ".claude" / ".credentials.json"
@@ -8369,6 +8661,31 @@ class TestSharedOAuthCredentialPreservation:
         assert activated["mcpOAuth"] == {
             "server": {"refreshToken": "current"}
         }
+
+    def test_direct_activation_keeps_an_unswapped_design_login(self, temp_home):
+        switcher, _ = TestDirectActivationPreservation()._setup(temp_home)
+        set_setting(switcher.backup_dir, "swap.designLogin", "false")
+        live_path = temp_home / ".claude" / ".credentials.json"
+        live_path.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-unmanaged", "refreshToken": "rt-unmanaged",
+            },
+            "designOauth": {"refreshToken": "design-current"},
+        }))
+        target = json.loads(
+            switcher._read_account_credentials("1", "one@example.com")
+        )
+        target["designOauth"] = {"refreshToken": "design-stale"}
+        switcher._write_account_credentials(
+            "1", "one@example.com", json.dumps(target)
+        )
+
+        with patch.object(switcher, "list_accounts"):
+            switcher._perform_switch("1", emit_output=False)
+
+        activated = json.loads(live_path.read_text())
+        assert activated["claudeAiOauth"]["accessToken"] == "sk-one"
+        assert activated["designOauth"] == {"refreshToken": "design-current"}
 
 
 class TestUuidConflictClassification:
@@ -9022,6 +9339,84 @@ class TestDisableEnableAccount:
 
         assert s.is_account_disabled("2") is False
 
+    # -- malformed on-disk data --------------------------------------------
+
+    @pytest.mark.parametrize(
+        "accounts",
+        [
+            pytest.param(None, id="accounts-is-null"),
+            pytest.param([{"email": "a@example.com"}], id="accounts-is-a-list"),
+            pytest.param({"1": "a@example.com"}, id="record-is-not-an-object"),
+        ],
+    )
+    def test_disabled_flag_reads_false_on_a_malformed_roster(
+        self, temp_home, accounts
+    ):
+        """A hand-edited sequence.json must not crash the disabled lookup.
+
+        The flag read is already total for everything that is simply absent
+        — no accounts map, no record for the slot — and answers "not
+        disabled". A map or a record of the wrong JSON type took the same
+        path and raised a bare AttributeError, which `cli.py`'s
+        `except ClaudeSwitchError` does not catch: the user got a traceback
+        instead of the clean error line `_get_sequence_data` exists to
+        produce.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        data = s._get_sequence_data()
+        data["accounts"] = accounts
+        s._write_json(s.sequence_file, data)
+
+        assert s.is_account_disabled("1") is False
+        assert s.disabled_account_numbers() == []
+
+    def test_slot_refresh_keeps_account_parked(self, temp_home):
+        """`cswap add --slot N` on the account already in slot N is the
+        documented way to recover a dead login; it refreshes the credential
+        rather than re-registering the account, so the park must survive it.
+        Bare `cswap add` (refresh in place) already keeps the flag."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+        self._make_live(temp_home, "b@example.com", 2)
+
+        s.add_account(slot=2)
+
+        assert s.is_account_disabled("2") is True
+        assert s.switchable_account_numbers() == ["1"]
+
+    def test_slot_migration_keeps_account_parked(self, temp_home):
+        """Moving a parked account to another slot carries the flag along,
+        the same way it carries the alias."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+        self._make_live(temp_home, "b@example.com", 2)
+
+        s.add_account(slot=5)
+
+        assert "2" not in s._get_sequence_data()["accounts"]
+        assert s.is_account_disabled("5") is True
+
+    def test_displacing_a_parked_account_does_not_inherit_its_flag(
+        self, temp_home,
+    ):
+        """Overwriting slot N with a different account ends that slot's
+        lineage, so the newcomer starts in rotation."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+        self._make_live(temp_home, "a@example.com", 1)
+
+        s.add_account(slot=2, assume_yes=True)
+
+        assert s._get_sequence_data()["accounts"]["2"]["email"] == "a@example.com"
+        assert s.is_account_disabled("2") is False
+
     # -- warnings ----------------------------------------------------------
 
     def test_disable_active_account_warns_but_sets_flag(self, temp_home, capsys):
@@ -9079,6 +9474,466 @@ class TestDisableEnableAccount:
         assert rows[2].get("disabled") is True
         # Additive: absent (not False) on enabled rows.
         assert "disabled" not in rows[1]
+
+
+class TestExpiringStrategy:
+    """``cswap expires`` bookkeeping and ``switch --strategy expiring``.
+
+    The recorded date is the only signal cswap cannot measure; usage only
+    gates which expiring account is actionable, at the autoswitch threshold."""
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
+        s._write_account_credentials(
+            str(num), email,
+            json.dumps({"claudeAiOauth": {
+                "accessToken": f"sk-{num}", "refreshToken": f"rt-{num}"}}),
+        )
+        s._write_account_config(
+            str(num), email,
+            json.dumps({"oauthAccount": {
+                "emailAddress": email, "accountUuid": f"uuid-{num}"}}),
+        )
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None, "lastUpdated": "",
+            "sequence": [], "accounts": {},
+        }
+        data["accounts"][str(num)] = {
+            "email": email, "uuid": f"uuid-{num}",
+            "organizationUuid": "", "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        if data["activeAccountNumber"] is None:
+            data["activeAccountNumber"] = num
+        s._write_json(s.sequence_file, data)
+
+    def _make_live(self, temp_home: Path, email: str, num: int) -> None:
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {
+                "accessToken": f"sk-live-{num}", "refreshToken": f"rt-live-{num}"}})
+        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"}
+        }))
+
+    @staticmethod
+    def _day(offset: int) -> str:
+        from datetime import date, timedelta
+        return (date.today() + timedelta(days=offset)).isoformat()
+
+    @staticmethod
+    def _usage(seven_day: float, five_hour: float = 0.0, scoped=None) -> dict:
+        u = {
+            "five_hour": {"pct": five_hour, "resets_at": "2030-01-01T05:00:00+00:00"},
+            "seven_day": {"pct": seven_day, "resets_at": "2030-01-02T07:00:00+00:00"},
+        }
+        if scoped is not None:
+            u["scoped"] = scoped
+        return u
+
+    # -- bookkeeping -------------------------------------------------------
+
+    def test_set_and_clear_round_trip(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        s.set_account_expires("2", self._day(5))
+        assert s._get_sequence_data()["accounts"]["2"]["expiresAt"] == self._day(5)
+        assert "Recorded Account-2" in capsys.readouterr().out
+
+        s.set_account_expires("b@example.com", None)
+        assert "expiresAt" not in s._get_sequence_data()["accounts"]["2"]
+        assert "Cleared Account-2" in capsys.readouterr().out
+
+    def test_set_by_alias_and_normalizes_compact_iso(self, temp_home):
+        """Python's date parser accepts ``20260916``; the stored form must be
+        the dashed one so the listing's string sort stays a date sort."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        s.set_alias("1", "dev")
+
+        s.set_account_expires("dev", "20300916")
+
+        assert s._get_sequence_data()["accounts"]["1"]["expiresAt"] == "2030-09-16"
+
+    def test_invalid_date_raises_and_writes_nothing(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+
+        with pytest.raises(ConfigError, match="Invalid date"):
+            s.set_account_expires("1", "2030-9-16")
+        with pytest.raises(ConfigError, match="Invalid date"):
+            s.set_account_expires("1", "tomorrow")
+        assert "expiresAt" not in s._get_sequence_data()["accounts"]["1"]
+
+    def test_unknown_account_raises(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+
+        with pytest.raises(AccountNotFoundError):
+            s.set_account_expires("99", self._day(1))
+
+    def test_ambiguous_email_raises(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "same@example.com")
+        self._seed(s, 2, "same@example.com")
+
+        with pytest.raises(ConfigError):
+            s.set_account_expires("same@example.com", self._day(1))
+
+    def test_past_date_is_recorded_but_warned(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+
+        s.set_account_expires("1", self._day(-1))
+
+        out = capsys.readouterr().out
+        assert s._get_sequence_data()["accounts"]["1"]["expiresAt"] == self._day(-1)
+        assert "already passed" in out
+
+    def test_disabled_account_accepts_a_date_with_a_hint(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("2", True)
+        capsys.readouterr()
+
+        s.set_account_expires("2", self._day(3))
+
+        assert "cswap enable 2" in capsys.readouterr().out
+        assert s.list_expirations() == [("2", self._day(3), "b@example.com")]
+
+    def test_list_sorts_soonest_first_ties_in_sequence_order(self, temp_home):
+        s = self._setup(temp_home)
+        for n, e in ((1, "a@x"), (2, "b@x"), (3, "c@x"), (4, "d@x")):
+            self._seed(s, n, e)
+        s.set_account_expires("4", self._day(2))
+        s.set_account_expires("3", self._day(9))
+        s.set_account_expires("1", self._day(9))
+
+        assert s.list_expirations() == [
+            ("4", self._day(2), "d@x"),
+            ("1", self._day(9), "a@x"),
+            ("3", self._day(9), "c@x"),
+        ]
+
+    def test_list_ignores_unparseable_hand_edit(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        data = s._get_sequence_data()
+        data["accounts"]["1"]["expiresAt"] = "soon"
+        s._write_json(s.sequence_file, data)
+
+        assert s.list_expirations() == []
+        assert s._expires_from_data(data, "1") is None
+
+    # -- selection ---------------------------------------------------------
+
+    def test_none_when_no_future_expirations(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_expires("2", self._day(-1))  # lapsed
+
+        assert s._select_expiring_switchable("1", usage={}) == (None, "none", {}, [])
+
+    def test_picks_soonest_with_room_skipping_saturated(self, temp_home):
+        """Soonest-expiring (2) is at 95% weekly → skipped and reported with
+        its reset; the next-soonest with room (3) is the target."""
+        s = self._setup(temp_home)
+        for n, e in ((1, "a@x"), (2, "b@x"), (3, "c@x")):
+            self._seed(s, n, e)
+        s.set_account_expires("2", self._day(1))
+        s.set_account_expires("3", self._day(5))
+        usage = {"1": self._usage(10), "2": self._usage(95), "3": self._usage(40)}
+
+        target, note, pending, unreadable = s._select_expiring_switchable(
+            "1", usage=usage, threshold=90.0
+        )
+
+        assert (target, note) == ("3", "")
+        assert pending == {"2": "2030-01-02T07:00:00+00:00"}
+        assert unreadable == []
+
+    def test_threshold_is_the_gate_not_100_percent(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@x")
+        self._seed(s, 2, "b@x")
+        s.set_account_expires("2", self._day(1))
+        usage = {"1": self._usage(0), "2": self._usage(95)}
+
+        with_default = s._select_expiring_switchable("1", usage=usage, threshold=90.0)
+        raw = s._select_expiring_switchable("1", usage=usage, threshold=100.0)
+
+        assert with_default[:2] == (None, "exhausted")
+        assert raw[:2] == ("2", "")
+
+    def test_five_hour_window_binds_too(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@x")
+        self._seed(s, 2, "b@x")
+        s.set_account_expires("2", self._day(1))
+        usage = {"1": self._usage(0), "2": self._usage(seven_day=10, five_hour=100)}
+
+        target, note, pending, _ = s._select_expiring_switchable(
+            "1", usage=usage, threshold=90.0
+        )
+
+        assert (target, note) == (None, "exhausted")
+        assert pending == {"2": "2030-01-01T05:00:00+00:00"}
+
+    def test_equal_dates_resolve_to_earliest_slot(self, temp_home):
+        s = self._setup(temp_home)
+        for n, e in ((1, "a@x"), (2, "b@x"), (3, "c@x"), (4, "d@x"), (5, "e@x")):
+            self._seed(s, n, e)
+        for n in ("5", "3", "4"):
+            s.set_account_expires(n, self._day(4))
+        usage = {n: self._usage(0) for n in ("1", "2", "3", "4", "5")}
+
+        for _ in range(5):
+            target, _, _, _ = s._select_expiring_switchable("1", usage=usage, threshold=90.0)
+            assert target == "3"
+
+    def test_disabled_and_lapsed_are_not_candidates(self, temp_home):
+        s = self._setup(temp_home)
+        for n, e in ((1, "a@x"), (2, "b@x"), (3, "c@x"), (4, "d@x")):
+            self._seed(s, n, e)
+        s.set_account_expires("2", self._day(-3))   # lapsed
+        s.set_account_expires("3", self._day(1))    # disabled below
+        s.set_account_expires("4", self._day(8))
+        s.set_account_disabled("3", True)
+        usage = {n: self._usage(0) for n in ("1", "2", "3", "4")}
+
+        target, note, _, _ = s._select_expiring_switchable("1", usage=usage, threshold=90.0)
+
+        assert (target, note) == ("4", "")
+
+    def test_current_soonest_but_saturated_moves_to_next(self, temp_home):
+        """The user's own case: current expires first but has no room now; a
+        later-expiring account with room wins, and current is reported."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@x")
+        self._seed(s, 2, "b@x")
+        s.set_account_expires("1", self._day(1))
+        s.set_account_expires("2", self._day(6))
+        usage = {"1": self._usage(96), "2": self._usage(30)}
+
+        target, note, pending, _ = s._select_expiring_switchable(
+            "1", usage=usage, threshold=90.0
+        )
+
+        assert (target, note) == ("2", "")
+        assert list(pending) == ["1"]
+
+    def test_current_soonest_with_room_stays(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@x")
+        self._seed(s, 2, "b@x")
+        s.set_account_expires("1", self._day(1))
+        s.set_account_expires("2", self._day(6))
+        usage = {"1": self._usage(50), "2": self._usage(0)}
+
+        assert s._select_expiring_switchable("1", usage=usage, threshold=90.0) == (
+            None, "stay", {}, []
+        )
+
+    def test_unreadable_usage_is_skipped_but_not_called_exhausted(self, temp_home):
+        s = self._setup(temp_home)
+        for n, e in ((1, "a@x"), (2, "b@x"), (3, "c@x")):
+            self._seed(s, n, e)
+        s.set_account_expires("2", self._day(1))
+        s.set_account_expires("3", self._day(2))
+        usage = {"1": self._usage(0), "2": USAGE_TOKEN_EXPIRED, "3": None}
+
+        target, note, pending, unreadable = s._select_expiring_switchable(
+            "1", usage=usage, threshold=90.0
+        )
+
+        assert (target, note) == (None, "exhausted")
+        assert pending == {}
+        assert unreadable == ["2", "3"]
+
+    def test_model_window_binds_when_named(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@x")
+        self._seed(s, 2, "b@x")
+        s.set_account_expires("2", self._day(1))
+        scoped = [{"name": "Fable", "pct": 100.0, "resets_at": "2030-01-03T09:00:00+00:00"}]
+        usage = {"1": self._usage(0), "2": self._usage(10, scoped=scoped)}
+
+        plain = s._select_expiring_switchable("1", usage=usage, threshold=90.0)
+        pinned = s._select_expiring_switchable(
+            "1", models=("Fable",), usage=usage, threshold=90.0
+        )
+
+        assert plain[:2] == ("2", "")
+        assert pinned[:2] == (None, "exhausted")
+        assert pinned[2] == {"2": "2030-01-03T09:00:00+00:00"}
+
+    # -- switch() integration ----------------------------------------------
+
+    def test_switch_lands_on_target_and_names_skipped(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        for n, e in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            self._seed(s, n, e)
+        s.set_account_expires("2", self._day(1))
+        s.set_account_expires("3", self._day(5))
+        self._make_live(temp_home, "a@example.com", 1)
+        capsys.readouterr()
+        usage = {"1": self._usage(0), "2": self._usage(95), "3": self._usage(20)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            payload = s.switch(strategy="expiring", json_output=True)
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+        assert payload["switched"] is True
+        assert payload["strategy"] == "expiring"
+        assert any(w.startswith("Skipped: Account-2 resets at") for w in payload["warnings"])
+        # Structured counterpart of the same "Skipped: ..." warning text, so a
+        # script can find the skipped account without parsing a sentence.
+        assert payload["pendingExpiring"] == [
+            {"accountNumber": 2, "resetsAt": usage["2"]["seven_day"]["resets_at"],
+             "reason": "saturated"}
+        ]
+
+    def test_switch_omits_pending_expiring_when_nothing_skipped(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_expires("2", self._day(1))
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {"1": self._usage(0), "2": self._usage(0)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            payload = s.switch(strategy="expiring", json_output=True)
+
+        assert payload["switched"] is True
+        assert "pendingExpiring" not in payload
+
+    def test_switch_none_stay_and_exhausted_reasons(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        capsys.readouterr()
+
+        with patch.object(s, "_usage_by_account", return_value={}), \
+             patch.object(s, "list_accounts") as mock_list:
+            none = s.switch(strategy="expiring", json_output=True)
+        assert none["switched"] is False
+        assert none["reason"] == "no-expirations-recorded"
+
+        s.set_account_expires("1", self._day(1))
+        s.set_account_expires("2", self._day(3))
+        usage = {"1": self._usage(10), "2": self._usage(0)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            stay = s.switch(strategy="expiring", json_output=True)
+        assert stay["reason"] == "already-expiring-best"
+        assert stay["from"] == stay["to"]
+
+        usage = {"1": self._usage(99), "2": self._usage(91)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            exhausted = s.switch(strategy="expiring", json_output=True)
+        assert exhausted["reason"] == "expiring-exhausted"
+        assert "90%" in exhausted["message"]
+        assert "Account-1 resets at" in exhausted["message"]
+        assert "Account-2 resets at" in exhausted["message"]
+
+        usage = {"1": USAGE_TOKEN_EXPIRED, "2": None}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            unreadable = s.switch(strategy="expiring", json_output=True)
+        assert unreadable["reason"] == "usage-unavailable"
+        assert "usage unavailable" in unreadable["message"]
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        mock_list.assert_not_called()
+
+    def test_switch_honours_configured_threshold(self, temp_home, capsys):
+        from claude_swap.settings import AutoSwitchSettings
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_expires("2", self._day(1))
+        self._make_live(temp_home, "a@example.com", 1)
+        capsys.readouterr()
+        usage = {"1": self._usage(0), "2": self._usage(85)}
+
+        with patch("claude_swap.switcher.load_settings",
+                   return_value=AutoSwitchSettings(threshold=80.0)), \
+             patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            payload = s.switch(strategy="expiring", json_output=True)
+
+        assert payload["switched"] is False
+        assert "80%" in payload["message"]
+
+    def test_switch_human_output_exhausted_warns(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_expires("2", self._day(1))
+        self._make_live(temp_home, "a@example.com", 1)
+        capsys.readouterr()
+        usage = {"1": self._usage(0), "2": self._usage(100)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="expiring")
+
+        captured = capsys.readouterr()
+        assert "at or above the 90% threshold" in captured.out + captured.err
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    # -- display -----------------------------------------------------------
+
+    def test_list_shows_expiration_line_and_json_field(self, temp_home, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_expires("2", self._day(4))
+        capsys.readouterr()
+
+        with patch.object(s, "_read_credentials", return_value=""), \
+             patch.object(s, "_read_account_credentials", return_value=""):
+            s.list_accounts()
+            payload = s.list_accounts(json_output=True)
+
+        out = capsys.readouterr().out
+        assert f"expires {self._day(4)} (+4d)" in out
+        rows = {r["number"]: r for r in payload["accounts"]}
+        assert rows[2]["planExpiresAt"] == self._day(4)
+        assert "planExpiresAt" not in rows[1]
+        assert "loginExpiresAt" not in rows[2]
+
+    def test_snapshot_carries_expires_at(self, temp_home):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_expires("2", self._day(4))
+
+        with patch.object(s, "_read_credentials", return_value=""), \
+             patch.object(s, "_read_account_credentials", return_value=""):
+            snap = s.accounts_snapshot()
+
+        by_num = {a.number: a for a in snap.accounts}
+        assert by_num["2"].expires_at == self._day(4)
+        assert by_num["1"].expires_at is None
 
 
 class TestDegradedReadProvenance:
@@ -9319,6 +10174,23 @@ class TestBackupReadTriState:
             "1", "test@example.com"
         )
         assert value == "CREDS"
+        assert unreadable is False
+
+    def test_non_utf8_enc_is_corrupt_not_a_crash(self, temp_home: Path):
+        # The .enc is the only backend here, so undecodable bytes have to reach
+        # the same content-level verdict as bad base64 rather than raising out
+        # of a reader every caller expects to answer with a value.
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._store._write_account_credentials("1", "test@example.com", "CREDS")
+        s._store._backup_enc_path("1", "test@example.com").write_bytes(
+            b"\xff\xfegarbled"
+        )
+        value, unreadable = s._store._read_account_credentials_ex(
+            "1", "test@example.com"
+        )
+        assert value == ""
         assert unreadable is False
 
 
@@ -12409,6 +13281,25 @@ class TestStashReaderUnreadableVsAbsent:
             "POST-side assertion"
         )
 
+    def test_undecodable_entry_bytes_are_corrupt_not_a_crash(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """Bytes that are not UTF-8 at all are the same corrupt entry as bad
+        base64, and must reach the same terminal verdict instead of raising
+        out of the reader on the caller's behalf."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        entry_path = s._store._stash_entry_path(self._stash_successor(s))
+        entry_path.write_bytes(b"\xff\xfegarbled")
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._post_rejects_spent) as post:
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert post.called
+        assert out.error == "invalid_grant"
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
     def test_row_d_absent_entry_bytes_terminate_instead_of_deferring(
         self, temp_home: Path, sample_sequence_data: dict,
     ):
@@ -12577,3 +13468,125 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestLoginExpiry:
+    """The ~30-day login deadline: warned ahead, and named when it lapses."""
+
+    DAY_MS = 24 * 3600 * 1000
+
+    @staticmethod
+    def _creds(deadline_ms=None, access="sk-backup", refresh="rt-backup"):
+        data = {"accessToken": access, "refreshToken": refresh,
+                "expiresAt": int(time.time() * 1000) + 3600 * 1000}
+        if deadline_ms is not None:
+            data["refreshTokenExpiresAt"] = deadline_ms
+        return json.dumps({"claudeAiOauth": data})
+
+    def test_dead_sentinel_is_named_by_the_verdict(self):
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED, USAGE_RELOGIN_REQUIRED
+        from claude_swap.switcher import dead_token_sentinel
+
+        now_ms = int(time.time() * 1000)
+        lapsed = self._creds(now_ms - 1000)
+        live = self._creds(now_ms + 20 * self.DAY_MS)
+        assert dead_token_sentinel(UsageEntry(last_error="login_expired")) == USAGE_LOGIN_EXPIRED
+        assert dead_token_sentinel(UsageEntry(last_error="invalid_grant")) == USAGE_RELOGIN_REQUIRED
+        assert dead_token_sentinel(UsageEntry(last_error="invalid_grant"), live) == USAGE_RELOGIN_REQUIRED
+        # A legacy strike (written before the cause was named) still reads as
+        # the login lapsing when the stored deadline has passed.
+        assert dead_token_sentinel(UsageEntry(last_error="invalid_grant"), lapsed) == USAGE_LOGIN_EXPIRED
+        assert dead_token_sentinel(UsageEntry(last_error="no_refresh_token"), lapsed) == USAGE_RELOGIN_REQUIRED
+        assert dead_token_sentinel(UsageEntry()) == USAGE_RELOGIN_REQUIRED
+
+    def test_warning_line_only_inside_the_last_week_and_never_over_a_quarantine(self):
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED, USAGE_RELOGIN_REQUIRED
+        from claude_swap.switcher import login_expiry_warning_from_ms
+
+        now = 1_800_000_000_000
+        soon = now + 2 * self.DAY_MS
+        assert login_expiry_warning_from_ms(None, None, now) is None
+        assert login_expiry_warning_from_ms(now + 20 * self.DAY_MS, None, now) is None
+        line = login_expiry_warning_from_ms(soon, None, now)
+        assert line.startswith("login expires ") and "re-login before then" in line
+        lapsed = login_expiry_warning_from_ms(now - 1000, None, now)
+        assert lapsed.startswith("login expired ") and "re-login needed" in lapsed
+        assert login_expiry_warning_from_ms(soon, USAGE_LOGIN_EXPIRED, now) is None
+        assert login_expiry_warning_from_ms(soon, USAGE_RELOGIN_REQUIRED, now) is None
+        assert login_expiry_warning_from_ms(soon, USAGE_TOKEN_EXPIRED, now) is not None
+
+    def test_list_warns_under_an_account_inside_its_last_week(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        now_ms = int(time.time() * 1000)
+        active_creds = self._creds(access="sk-active", refresh="rt-active")
+        backup_creds = self._creds(now_ms + 2 * self.DAY_MS)
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
+             patch("claude_swap.session.read_session_credentials", return_value=None):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        assert output.count("login expires ") == 1
+        assert "re-login before then: log in with Claude Code, then run: cswap add" in output
+
+    def test_list_names_a_lapsed_login_when_the_server_refuses_it(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        now_ms = int(time.time() * 1000)
+        active_creds = self._creds(access="sk-active", refresh="rt-active")
+        lapsed = self._creds(now_ms - 1000)
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        refused = oauth.UsageOutcome(
+            None, error="login_expired", struck_fp=oauth.credential_fingerprint(lapsed)
+        )
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=lapsed), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=refused), \
+             patch("claude_swap.session.read_session_credentials", return_value=None):
+            switcher.list_accounts()
+            output = capsys.readouterr().out
+            assert "re-login needed — login expired (Claude Code logins expire about a month after login)" in output
+            assert "refresh token dead" not in output
+            # The quarantine holds on the next pass without another POST, and
+            # the heads-up line does not double up under the sentinel.
+            payload = switcher.list_accounts(json_output=True)
+
+        by_num = {a["number"]: a for a in payload["accounts"]}
+        assert by_num[2]["usageStatus"] == "relogin_required"
+        assert by_num[2]["loginExpired"] is True
+        assert "loginExpired" not in by_num[1]
+
+    def test_snapshot_carries_the_login_deadline(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        deadline = int(time.time() * 1000) + 9 * self.DAY_MS
+        active_creds = self._creds(access="sk-active", refresh="rt-active")
+        backup_creds = self._creds(deadline)
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
+             patch("claude_swap.session.read_session_credentials", return_value=None):
+            snap = switcher.accounts_snapshot()
+
+        by_num = {a.number: a for a in snap.accounts}
+        assert by_num["1"].login_expires_at is None
+        assert by_num["2"].login_expires_at == deadline

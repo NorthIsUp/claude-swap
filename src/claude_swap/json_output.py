@@ -8,6 +8,7 @@ the single ``json.dumps`` (see cli.py).
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 from claude_swap import oauth, pace
@@ -32,6 +33,13 @@ USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
 # replaces the credential; distinct from "token expired" (which Claude Code can
 # refresh on its own) because only the user can fix it.
 USAGE_RELOGIN_REQUIRED = "re-login needed"
+# Same quarantine, named by its cause: the server rejected the refresh grant
+# AFTER the login's recorded deadline (``refreshTokenExpiresAt``) had passed —
+# a Claude Code login reaching its deadline, not a refresh token lost to a race
+# or another machine. Projects to the same ``relogin_required`` status (the
+# remedy is identical, and scripts key on that) while the human note stops
+# sending anyone hunting for a thief.
+USAGE_LOGIN_EXPIRED = "login expired"
 # The profile oracle proved the live credential belongs to a DIFFERENT account
 # than the slot's identity (foreign credential under a stale config — partial
 # cross-machine sync or a mid-``/login`` poll). Its quota is not this slot's, so
@@ -52,6 +60,8 @@ def _window_to_json(entry: dict) -> dict:
     out: dict = {"pct": entry["pct"]}
     if "resets_at" in entry:
         out["resetsAt"] = entry["resets_at"]
+    if entry.get("resets_at_inferred"):
+        out["resetsAtInferred"] = True
     cell = oauth.fresh_reset_strings(entry)
     if cell:
         out["countdown"], out["clock"] = cell
@@ -132,6 +142,80 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
     return out
 
 
+def _is_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _window_from_json(window: object, label: str) -> dict:
+    """One JSON window back to the internal shape, fetch-time strings rebuilt."""
+    if not isinstance(window, dict):
+        raise ValueError(f"{label} must be an object")
+    pct = window.get("pct")
+    if not _is_number(pct) or pct < 0:
+        raise ValueError(f"{label}.pct must be a non-negative number")
+    out: dict = {"pct": float(pct)}
+    resets_at = window.get("resetsAt")
+    if resets_at is not None:
+        if not isinstance(resets_at, str):
+            raise ValueError(f"{label}.resetsAt must be an ISO-8601 string")
+        try:
+            out["countdown"], out["clock"] = oauth.format_reset(resets_at)
+        except (ValueError, TypeError):
+            raise ValueError(f"{label}.resetsAt is not an ISO-8601 time: {resets_at!r}")
+        out["resets_at"] = resets_at
+    return out
+
+
+def usage_from_json(usage: object) -> dict:
+    """Read a ``usage`` object from ``list --json`` back into the internal dict.
+
+    The inverse of :func:`usage_to_json` for what the API measured: ``pct``,
+    ``resetsAt``, the spend amounts and the scoped model names. Everything
+    derived at serialization (countdown, clock, pace fields) is dropped, and
+    the fetch-time strings are rebuilt from ``resets_at``, which gives the
+    shape :func:`oauth.build_usage_result` stores. Raises ``ValueError`` on
+    anything malformed, so an importer can refuse a document before writing
+    any of it.
+    """
+    if not isinstance(usage, dict):
+        raise ValueError("usage must be an object")
+    out: dict = {}
+    if "fiveHour" in usage:
+        out["five_hour"] = _window_from_json(usage["fiveHour"], "fiveHour")
+    if "sevenDay" in usage:
+        out["seven_day"] = _window_from_json(usage["sevenDay"], "sevenDay")
+    if "spend" in usage:
+        spend = usage["spend"]
+        out_spend = _window_from_json(spend, "spend")
+        for key in ("used", "limit"):
+            if not _is_number(spend.get(key)):
+                raise ValueError(f"spend.{key} must be a number")
+            out_spend[key] = float(spend[key])
+        if not isinstance(spend.get("currency"), str):
+            raise ValueError("spend.currency must be a string")
+        out_spend["currency"] = spend["currency"]
+        out["spend"] = out_spend
+    if "scoped" in usage:
+        if not isinstance(usage["scoped"], list):
+            raise ValueError("scoped must be a list")
+        scoped = []
+        for i, window in enumerate(usage["scoped"]):
+            label = f"scoped[{i}]"
+            entry = _window_from_json(window, label)
+            name = window.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"{label}.name must be a non-empty string")
+            scoped.append({"name": name, **entry})
+        out["scoped"] = scoped
+    if not out:
+        raise ValueError("usage carries no windows")
+    return out
+
+
 def usage_fields(
     entry: dict | str | None, fetched_at: float | None = None
 ) -> tuple[str, dict | None]:
@@ -146,7 +230,10 @@ def usage_fields(
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
     ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to
     another account; usage suppressed, a switch repairs the drift), the
-    ``USAGE_NO_CREDENTIALS`` sentinel, or ``None`` (fetch failed). ``fetched_at``
+    ``USAGE_NO_CREDENTIALS`` sentinel, the ``USAGE_RELOGIN_REQUIRED`` /
+    ``USAGE_LOGIN_EXPIRED`` sentinels (dead refresh-token lineage — the second
+    names the cause: the login's recorded deadline had passed; both project to
+    ``relogin_required``), or ``None`` (fetch failed). ``fetched_at``
     is forwarded to ``usage_to_json`` for the weekly pace fields (issue #125).
     """
     if isinstance(entry, dict):
@@ -157,13 +244,40 @@ def usage_fields(
         return "api_key", None
     if entry == USAGE_KEYCHAIN_UNAVAILABLE:
         return "keychain_unavailable", None
-    if entry == USAGE_RELOGIN_REQUIRED:
+    if entry in (USAGE_RELOGIN_REQUIRED, USAGE_LOGIN_EXPIRED):
         return "relogin_required", None
     if entry == USAGE_FOREIGN_CREDENTIAL:
         return "foreign_credential", None
     if isinstance(entry, str):
         return "no_credentials", None
     return "unavailable", None
+
+
+_RATE_LIMIT_MULTIPLIERS = {
+    "default_claude_ai": 1,
+    "default_claude_max_5x": 5,
+    "default_claude_max_20x": 20,
+}
+
+
+def _oauth_account_capacity_fields(credentials: str | None) -> dict:
+    """Additive account-capacity metadata from a Claude AI OAuth credential."""
+    oauth_data = oauth.extract_oauth_data(credentials) if credentials else None
+    if not oauth_data:
+        return {}
+    out: dict = {}
+    subscription_type = oauth_data.get("subscriptionType")
+    if isinstance(subscription_type, str) and subscription_type in {"pro", "max"}:
+        out["subscriptionType"] = subscription_type
+    rate_limit_tier = oauth_data.get("rateLimitTier")
+    multiplier = (
+        _RATE_LIMIT_MULTIPLIERS.get(rate_limit_tier)
+        if isinstance(rate_limit_tier, str)
+        else None
+    )
+    if multiplier is not None:
+        out["rateLimitMultiplier"] = multiplier
+    return out
 
 
 def account_ref(number: int | None, email: str) -> dict:
@@ -235,6 +349,7 @@ def account_row(
     active: bool,
     usage_entry: dict | str | None,
     *,
+    credentials: str | None = None,
     usage_fetched_at: float | None = None,
     usage_age_s: float | None = None,
     last_good_usage: dict | None = None,
@@ -243,6 +358,8 @@ def account_row(
     alias: str = "",
     disabled: bool = False,
     login_expires_at: str | None = None,
+    plan_expires_at: str | None = None,
+    login_expired: bool = False,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -257,6 +374,7 @@ def account_row(
         "usageStatus": status,
         "usage": usage,
     }
+    row.update(_oauth_account_capacity_fields(credentials))
     if alias:
         row["alias"] = alias
     # Additive field: present only when the slot is held out of rotation, so
@@ -268,6 +386,17 @@ def account_row(
     # ``relogin_required`` that follows; absent when the login carries none.
     if login_expires_at:
         row["loginExpiresAt"] = login_expires_at
+    # Additive field: the user-recorded subscription-cancellation date (see
+    # ``ClaudeAccountSwitcher.set_account_expires``) — distinct from
+    # ``loginExpiresAt``, which is the OAuth refresh token's own expiry.
+    if plan_expires_at:
+        row["planExpiresAt"] = plan_expires_at
+    # Additive: the recorded deadline has passed. Derived from the stored
+    # stamp, not from a server verdict — a slot can still fetch usage on its
+    # last access token for a few hours after this flips, but its next
+    # refresh will be refused, so a script should treat it as due now.
+    if login_expired:
+        row["loginExpired"] = True
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:
