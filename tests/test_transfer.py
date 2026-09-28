@@ -2098,7 +2098,7 @@ def _usage_document(*rows: dict) -> str:
 
 
 class TestImportUsage:
-    def _import(self, switcher, home: Path, document: str, hold_s: float = 0.0):
+    def _import(self, switcher, home: Path, document: str, hold_s: float | None = None):
         from claude_swap.transfer import import_usage
 
         path = home / "usage.json"
@@ -2159,6 +2159,25 @@ class TestImportUsage:
         # 400s is past STALE_OK_S: the hold is what keeps it decision-grade.
         assert bob["usageStatus"] == "ok"
         assert bob["usage"]["fiveHour"]["pct"] == 42.0
+
+    def test_a_zero_hold_hands_the_account_back(self, temp_home: Path, capsys):
+        """``--hold 0`` lifts the hold an earlier hand-over set, so the next
+        collector fetches the account itself instead of waiting it out."""
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", creds=_live_creds("alice"))
+        document = _usage_document(_usage_row("alice@example.com", age_s=400.0))
+        self._import(s, temp_home, document, hold_s=600.0)
+        self._import(s, temp_home, document, hold_s=0.0)
+        assert "holds lifted" in capsys.readouterr().err
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome({"five_hour": {"pct": 1.0}}),
+        ) as fetch:
+            s.list_accounts(json_output=True)
+        fetch.assert_called_once()
 
     def test_a_held_active_account_shows_its_reading_not_token_expired(
         self, temp_home: Path

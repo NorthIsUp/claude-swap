@@ -1874,6 +1874,64 @@ class TestAdopt:
         store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=60.0)
         assert store.entries(IDENT)["1"].held_until == clock.now + 60.0
 
+    def _usage_resetting_in(self, clock, five_hour_s, scoped_s=None):
+        from datetime import datetime, timezone
+
+        def iso(ahead):
+            return (
+                datetime.fromtimestamp(clock.now + ahead, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+        usage = {
+            "five_hour": {"pct": 25.0, "resets_at": iso(five_hour_s)},
+            "seven_day": {"pct": 10.0, "resets_at": iso(86_400.0)},
+        }
+        if scoped_s is not None:
+            usage["scoped"] = [{"name": "Fable", "pct": 5.0, "resets_at": iso(scoped_s)}]
+        return usage
+
+    def test_hold_stops_at_the_readings_earliest_reset(self, store, clock):
+        # Once a window rolls over, the held reading no longer describes it:
+        # the hold must not keep this machine from reading the new window.
+        usage = self._usage_resetting_in(clock, 300.0)
+        store.adopt({"1": (usage, 0.0)}, IDENT, hold_s=900.0)
+        assert store.entries(IDENT)["1"].held_until == pytest.approx(clock.now + 300.0)
+        clock.advance(300.0)
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_a_scoped_windows_reset_caps_the_hold_too(self, store, clock):
+        # A scoped window counts whichever models this machine watches.
+        usage = self._usage_resetting_in(clock, 3000.0, scoped_s=120.0)
+        store.adopt({"1": (usage, 0.0)}, IDENT, hold_s=900.0)
+        assert store.entries(IDENT)["1"].held_until == pytest.approx(clock.now + 120.0)
+
+    def test_the_cap_comes_from_the_reading_kept(self, store, clock):
+        # This machine's own reading is newer, so it is the one kept, and its
+        # reset is the one the hold must not outrun.
+        store.record({"1": FetchRecord(usage=self._usage_resetting_in(clock, 120.0))}, IDENT)
+        imported = self._usage_resetting_in(clock, 3000.0)
+        assert store.adopt({"1": (imported, 30.0)}, IDENT, hold_s=900.0) == set()
+        assert store.entries(IDENT)["1"].held_until == pytest.approx(clock.now + 120.0)
+
+    def test_a_reading_from_before_a_reset_is_not_held(self, store, clock):
+        usage = self._usage_resetting_in(clock, -60.0)
+        assert store.adopt({"1": (usage, 600.0)}, IDENT, hold_s=900.0) == {"1"}
+        assert store.entries(IDENT)["1"].held_until is None
+
+    def test_zero_hold_lifts_an_existing_hold(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=0.0)
+        assert store.entries(IDENT)["1"].held_until is None
+        clock.advance(SERVE_TTL_S + 1)
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_no_hold_leaves_an_existing_hold_alone(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        store.adopt({"1": (USAGE, 0.0)}, IDENT)
+        assert store.entries(IDENT)["1"].held_until == clock.now + 900.0
+
     def test_due_candidate_skips_a_held_slot(self, store, clock):
         store.adopt({"1": (USAGE, 0.0), "2": (USAGE, 0.0)}, IDENT, hold_s=600.0)
         plan = (clock.now + 60.0, 60.0)

@@ -1994,12 +1994,20 @@ class TestImportUsageCli:
             switcher_cls.return_value, "-", hold_s=600.0
         )
 
-    def test_no_hold_holds_nothing(self):
+    def test_no_hold_leaves_holds_alone(self):
         switcher_cls, import_fn = self._dispatch(
             ["cswap", "import-usage", "/tmp/usage.json"]
         )
         import_fn.assert_called_once_with(
-            switcher_cls.return_value, "/tmp/usage.json", hold_s=0.0
+            switcher_cls.return_value, "/tmp/usage.json", hold_s=None
+        )
+
+    def test_zero_hold_reaches_the_import_to_lift_holds(self):
+        switcher_cls, import_fn = self._dispatch(
+            ["cswap", "import-usage", "-", "--hold", "0"]
+        )
+        import_fn.assert_called_once_with(
+            switcher_cls.return_value, "-", hold_s=0.0
         )
 
     @pytest.mark.parametrize("argv,message", [

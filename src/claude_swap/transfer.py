@@ -677,25 +677,28 @@ def import_accounts(
 def import_usage(
     switcher: ClaudeAccountSwitcher,
     source: str,
-    hold_s: float = 0.0,
+    hold_s: float | None = None,
 ) -> None:
     """Adopt usage readings another machine took, from its ``cswap list --json``.
 
-    For machines that hold the same accounts: each one polling an account
-    spends the same usage-endpoint budget (see poll_policy), so a script can
-    let one machine poll and hand its readings to the rest.
+    For machines that hold the same accounts: when they share a login (moved
+    with ``export``/``import``) or the account is budgeted per account rather
+    than per token (see poll_policy), every machine polling it spends one
+    usage-endpoint budget, so a script can let one machine poll and hand its
+    readings to the rest.
 
     Each row with decision-grade usage (``usageStatus`` "ok") is matched to a
     local slot by (email, organizationUuid), the key ``import`` uses, and
     handed to :meth:`UsageStore.adopt` with ``usageAgeSeconds`` as its age.
     Rows without usage, and accounts not managed here, are skipped. With
     ``hold_s``, no local collector fetches the matched accounts for that long
-    (bounded; see ``adopt``).
+    (bounded; see ``adopt``); 0 lifts an earlier hold, ``None`` keeps it.
 
     Args:
         switcher: Initialized ClaudeAccountSwitcher.
         source: File path, or "-" for stdin.
-        hold_s: Seconds no local collector may fetch the matched accounts.
+        hold_s: Seconds no local collector may fetch the matched accounts,
+            0 to lift an earlier hold, None to leave it as it is.
 
     Raises:
         TransferError: malformed document or unsupported schema version.
@@ -771,6 +774,8 @@ def import_usage(
         f"Done: {len(adopted)} adopted, {len(readings) - len(adopted)} kept, "
         f"{skipped} skipped"
     )
-    if hold_s > 0 and readings:
-        summary += f"; fetching held for up to {hold_s:.0f}s"
+    if hold_s is not None and readings:
+        summary += (
+            f"; fetching held for up to {hold_s:.0f}s" if hold_s > 0 else "; holds lifted"
+        )
     _eprint(summary)

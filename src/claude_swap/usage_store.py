@@ -1205,7 +1205,7 @@ class UsageStore:
         self,
         readings: dict[str, tuple[dict, float]],
         identities: dict[str, Identity],
-        hold_s: float = 0.0,
+        hold_s: float | None = None,
     ) -> set[str]:
         """Merge measurements another machine took for the same accounts.
 
@@ -1223,12 +1223,14 @@ class UsageStore:
 
         ``hold_s`` > 0 stamps ``heldUntil``: no collector fetches the slot
         before then (``_row_eligible``, ``due_candidate``), and its last-good
-        stays decision-trusted meanwhile. The hold never runs past
-        ``TRUST_MAX_AGE_S`` from the stored measurement, so a slot cannot sit
-        unfetched on data too old to act on, and a producer that stops
-        renewing it gets ordinary collection back when it lapses. The latest
-        hold replaces an earlier one. Returns the slots whose ``lastGood``
-        was replaced.
+        stays decision-trusted meanwhile. The hold never runs past the stored
+        reading's earliest window reset, scoped windows included (after it the
+        reading no longer describes that window), nor past ``TRUST_MAX_AGE_S``
+        from the stored measurement, so a slot cannot sit unfetched on data
+        too old to act on, and a producer that stops renewing it gets ordinary
+        collection back when it lapses. The latest hold replaces an earlier
+        one, so ``hold_s`` 0 lifts it; ``None`` leaves it as it is. Returns
+        the slots whose ``lastGood`` was replaced.
         """
         if not readings:
             return set()
@@ -1244,8 +1246,19 @@ class UsageStore:
                 row["fetchedAt"] = fetched_at
                 stored = fetched_at
                 adopted.add(num)
-            if hold_s > 0:
-                row["heldUntil"] = min(now + hold_s, stored + TRUST_MAX_AGE_S)
+            if hold_s is None:
+                return
+            held_until = min(now + hold_s, stored + TRUST_MAX_AGE_S)
+            # Every scoped window, not only the models this machine watches:
+            # the store does not know them, and a hold lifted early costs one
+            # fetch at most.
+            reset_at = _earliest_reset(row.get("lastGood"), ("all",))
+            if reset_at is not None:
+                held_until = min(held_until, reset_at)
+            if held_until > now:
+                row["heldUntil"] = held_until
+            else:
+                row.pop("heldUntil", None)
 
         self._mutate(identities, readings.keys(), apply)
         return adopted
