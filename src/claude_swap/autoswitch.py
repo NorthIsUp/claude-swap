@@ -1131,7 +1131,7 @@ class AutoSwitchEngine:
                 and num not in quarantined
                 and self.switcher.account_kind_for(num) != "api_key"
                 and headroom.get(num) is not None
-                and (100.0 - headroom[num]) < settings.threshold
+                and not _windows_at_threshold(usage.get(num), self._models, settings)
             ]
             if not recovered:
                 self._emit(
@@ -1241,6 +1241,10 @@ class AutoSwitchEngine:
             for num in self.switcher.switchable_account_numbers()
             if num != current and num not in quarantined
         ]
+        if active_is_api_key:
+            # Only recovered subscriptions may end the key's resting state;
+            # at-limit ranking otherwise also admits peers above their line.
+            candidates = [num for num in candidates if num in recovered]
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]

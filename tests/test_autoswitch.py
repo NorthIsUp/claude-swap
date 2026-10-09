@@ -1816,6 +1816,23 @@ class TestApiKeyAccounts:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
 
+    @pytest.mark.parametrize("settings,usage,expected", [
+        ({"threshold": 99, "threshold_5h": 95}, _usage(96), TickOutcome.NO_ACTION),
+        ({"threshold": 95, "threshold_7d": 99},
+         {"five_hour": {"pct": 10}, "seven_day": {"pct": 97}},
+         TickOutcome.SWITCHED),
+    ])
+    def test_api_key_recovery_respects_per_window_thresholds(
+        self, temp_home, settings, usage, expected,
+    ):
+        h = EngineHarness(temp_home, include_api_key_accounts=True, **settings)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        assert h.tick_with_usage({"1": "api key", "2": usage}) is expected
+        assert h.active_number() == (2 if expected is TickOutcome.SWITCHED else 1)
+
 
 class TestFreshening:
     def test_near_expiry_target_is_refreshed_and_persisted(self, temp_home):
