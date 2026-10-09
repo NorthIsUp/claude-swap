@@ -7035,6 +7035,9 @@ class ClaudeAccountSwitcher:
           ``None`` rather than an empty-token dict, so the ``"wiped"``
           check misses it and the fail-open backup destroys the slot's
           refresh token. Never written into any slot.
+        - ``"api-key-mismatch"`` — an API-key slot's live read is not an
+          API key (a stale OAuth login or MCP-only store can shadow the key).
+          Keep its credential backup; OAuth bytes cannot be a rotated key.
         - ``"alien"``          — a *structurally complete* identity (uuid +
           email + organization) that matches no managed slot (unmanaged
           login, recycled email wearing a managed address, or an email+org
@@ -7059,6 +7062,11 @@ class ClaudeAccountSwitcher:
           the extra safety.
         """
         backup = self._read_account_credentials(current_account, current_email)
+        if (
+            data.get("accounts", {}).get(current_account, {}).get("kind") == "api_key"
+            or looks_like_api_key(backup)
+        ) and not looks_like_api_key(original_creds):
+            return ("api-key-mismatch", None)
         if backup and backup == original_creds:
             return ("own-bytes", None)
         if backup and (
@@ -7071,18 +7079,9 @@ class ClaudeAccountSwitcher:
             live_oauth.get("accessToken") or live_oauth.get("refreshToken")
         ):
             return ("wiped", None)
-        if live_oauth is None and backup and (
-            oauth.extract_oauth_data(backup)
-            # An API-key slot's live read turns into an mcpOAuth-only blob
-            # once Claude Code re-auths an MCP server into the OAuth item,
-            # which _read_active_credentials prefers over the managed key.
-            or (
-                looks_like_api_key(backup)
-                and not looks_like_api_key(original_creds)
-            )
-        ):
+        if live_oauth is None and backup and oauth.extract_oauth_data(backup):
             # Only the asymmetry — nothing to preserve on the live side, a
-            # refresh token or API key to lose on the slot's — is the
+            # refresh token to lose on the slot's — is the
             # destruction case.
             return ("oauth-absent", None)
         resolved = provenance.get("resolved")
@@ -7688,6 +7687,20 @@ class ClaudeAccountSwitcher:
                         f"credential already matches Account-{foreign_slot}'s "
                         "stored backup, so nothing was written into "
                         f"Account-{current_account}."
+                    )
+                    if emit_output:
+                        warning(msg)
+                    else:
+                        warnings_out.append(msg)
+                elif kind == "api-key-mismatch":
+                    # OAuth clear is best-effort. A surviving OAuth item can
+                    # shadow the active key, but must never replace its backup.
+                    self._write_account_config(
+                        current_account, current_email, original_config
+                    )
+                    msg = (
+                        f"The live credential is not an API key. Account-"
+                        f"{current_account}'s stored API key was kept."
                     )
                     if emit_output:
                         warning(msg)
