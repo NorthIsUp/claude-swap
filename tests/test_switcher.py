@@ -7435,9 +7435,8 @@ class TestProvenanceGuard:
     def test_api_key_slot_still_backs_up_its_rotated_key(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
-        """The #383 guard is gated on the BACKUP carrying OAuth, so a slot
-        that legitimately holds no OAuth on either side — an API-key slot —
-        keeps backing up normally."""
+        """An API-key slot still captures a legitimately rotated API key."""
+        sample_sequence_data["accounts"]["1"]["kind"] = "api_key"
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7475,6 +7474,36 @@ class TestProvenanceGuard:
             for p in patches:
                 p.stop()
         assert creds_store[("1", "test@example.com")] == "sk-ant-api03-key"
+
+    @pytest.mark.parametrize("live", [
+        json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-other", "refreshToken": "rt-other",
+        }}),
+        json.dumps({"mcpOAuth": {"some-server": {"accessToken": "mcp-token"}}}),
+    ])
+    def test_api_key_slot_never_captures_a_live_oauth_store(
+        self, temp_home, mock_claude_config, sample_sequence_data, live,
+    ):
+        """#384: a best-effort OAuth clear can leave a stale login over a key."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"]["kind"] = "api_key"
+        switcher._write_json(switcher.sequence_file, data)
+        creds_store[("1", "test@example.com")] = "sk-ant-api03-key"
+        live_state = {"creds": live}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == "sk-ant-api03-key"
+        assert json.loads(live_state["creds"])["claudeAiOauth"][
+            "accessToken"] == "sk-stale-2"
 
     def test_moved_bytes_between_prefetch_and_lock_fall_to_unresolved(
         self, temp_home, mock_claude_config, sample_sequence_data,
