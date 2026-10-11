@@ -47,7 +47,20 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    # "best": most headroom. "consume-first": soonest weekly reset, and it
+    # moves below the threshold too. "weekly-first": soonest weekly reset,
+    # but only once the active account reaches the threshold.
+    strategy: str = "best"
+    # Per-window thresholds. Each overrides ``threshold`` for that one window;
+    # None means "use ``threshold``". The 5h window recycles in hours and can
+    # burn a point a minute, so it wants margin; the 7d window is the one
+    # that expires unused, so it wants to run closer to the wall.
+    threshold_5h: float | None = None
+    threshold_7d: float | None = None
+    # Landing caps. A switch target must sit at or under these on its OWN 5h
+    # and 7d windows, on every trigger and every strategy. 100 = no cap.
+    landing_max_5h_pct: float = 100.0
+    landing_max_7d_pct: float = 100.0
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -57,6 +70,10 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Desktop notification when the headless `cswap auto` loop switches,
+    # quarantines, or finds everything exhausted (menubar.py already
+    # notifies for menu-bar users; this serves the CLI-only ones).
+    notify: bool = False
 
 
 @dataclass(frozen=True)
@@ -67,7 +84,26 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class SwapSettings:
+    """What a switch carries across accounts, beyond the login itself.
+
+    ``design_login`` is Claude Code's separate Claude Design credential, the
+    one ``/design-login`` writes. It sits in the same credential object as the
+    login, so by default it travels with the slot like any other account-bound
+    field. ``design_login=False`` leaves the live one in place instead, so one
+    design login serves every account: Claude Code does not require it to
+    belong to the account logged in beside it.
+    """
+
+    design_login: bool = True
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "swap": SwapSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -120,8 +156,24 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "weekly-first"),
             help="How auto-switch picks the target account",
+        ),
+        SettingSpec(
+            "autoswitch", "threshold5h", "threshold_5h", "float", 50.0, 99.9,
+            help="Switch when the 5h window reaches this pct (unset: use threshold)",
+        ),
+        SettingSpec(
+            "autoswitch", "threshold7d", "threshold_7d", "float", 50.0, 99.9,
+            help="Switch when the 7d window reaches this pct (unset: use threshold)",
+        ),
+        SettingSpec(
+            "autoswitch", "landingMax5hPct", "landing_max_5h_pct", "float", 0.0, 100.0,
+            help="Never switch onto an account with its 5h window above this pct (100 = off)",
+        ),
+        SettingSpec(
+            "autoswitch", "landingMax7dPct", "landing_max_7d_pct", "float", 0.0, 100.0,
+            help="Never switch onto an account with its 7d window above this pct (100 = off)",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
@@ -136,11 +188,46 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
         ),
         SettingSpec(
+            "autoswitch", "notify", "notify", "bool",
+            help="Desktop notification when cswap auto switches/quarantines/exhausts",
+        ),
+        SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
         ),
+        SettingSpec(
+            "swap", "designLogin", "design_login", "bool",
+            help="Give each account its own /design-login; false keeps one for every account",
+        ),
     )
 }
+
+def window_threshold(label: str, settings: AutoSwitchSettings) -> float:
+    """The threshold that applies to one window.
+
+    ``threshold_5h`` / ``threshold_7d`` override ``threshold`` for the two
+    account-wide windows when set. Every other window (a per-model scoped
+    window named by ``autoswitch.model``) uses ``threshold``.
+    """
+    if label == "5h" and settings.threshold_5h is not None:
+        return settings.threshold_5h
+    if label == "7d" and settings.threshold_7d is not None:
+        return settings.threshold_7d
+    return settings.threshold
+
+
+def poll_threshold(settings: AutoSwitchSettings) -> float:
+    """The lowest threshold any window can trip — what the poll planner
+    should tighten cadence toward, so an early 5h line is watched as closely
+    as the account-wide one. Shared by the engine's pin and the switcher's
+    settings-file fallback so every surface plans the same cadence."""
+    lines = [settings.threshold]
+    if settings.threshold_5h is not None:
+        lines.append(settings.threshold_5h)
+    if settings.threshold_7d is not None:
+        lines.append(settings.threshold_7d)
+    return min(lines)
+
 
 _AUTOSWITCH_KEYS: dict[str, str] = {
     spec.field: spec.json_key
@@ -184,7 +271,22 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
             clamped = num(value, spec.default, spec.lo, spec.hi)
             kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
         elif spec.kind == "bool":
-            kwargs[spec.field] = bool(value)
+            if isinstance(value, str):
+                # Never bool(str): bool("false") is True, so a hand-edited
+                # quoted "false" would switch the flag on rather than off. A
+                # quoted boolean is read by the same words `cswap config set`
+                # accepts; anything else is a bad type and reverts to the
+                # default like the other kinds do.
+                parsed = _BOOL_WORDS.get(value.strip().lower())
+                if parsed is None:
+                    _logger.warning(
+                        "settings.json: %s expects a boolean, got %r; using %r",
+                        spec.dotted, value, spec.default,
+                    )
+                    parsed = spec.default
+                kwargs[spec.field] = parsed
+            else:
+                kwargs[spec.field] = bool(value)
         elif spec.kind == "string":
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.
@@ -246,6 +348,23 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         return default
     return UiSettings(theme=theme)
+
+
+def load_swap_settings(backup_root: Path) -> SwapSettings:
+    """Load the swap section; missing/corrupt file or non-bool field → defaults."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("swap")
+    default = SwapSettings()
+    if not isinstance(section, dict):
+        return default
+    value = section.get("designLogin", default.design_login)
+    if not isinstance(value, bool):
+        _logger.warning(
+            "settings.json: swap.designLogin must be true or false, got %r; using %r",
+            value, default.design_login,
+        )
+        return default
+    return SwapSettings(design_login=value)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -412,6 +531,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "swap": load_swap_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
@@ -431,6 +551,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("notify", "notify"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

@@ -3,8 +3,9 @@
 Runs :class:`AutoSwitchEngine` in a thread worker and renders its typed
 events. Opens in **dry-run** — opening a view must never start switching
 accounts on its own; going live is an explicit, confirmed action. The
-engine's own state file semantics (shared cooldown, quarantine list, state
-lock) make it safe to run alongside an external ``cswap auto``.
+engine's own state file semantics (per-config-dir cooldown and switch
+history, shared quarantine list, state lock) make it safe to run alongside
+an external ``cswap auto``.
 
 The active account's full card sits on top (same widget as the dashboard's
 panel, with the threshold tick); this screen adds the engine badge, the
@@ -312,13 +313,22 @@ class AutoScreen(Screen):
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
-                ranked.append((998.0, acc.number))
+                key = 998.0
             elif pct is None:
                 entry.append("  usage unknown", style=palette.muted)
-                ranked.append((999.0, acc.number))
+                key = 999.0
             else:
                 entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
-                ranked.append((pct, acc.number))
+                key = pct
+            # The engine draws its candidates from switchable_account_numbers,
+            # which drops slots the user disabled, so ranking one here names a
+            # switch target it will never take — and a rested account usually
+            # has the headroom to head the list. Mark it and sink it rather
+            # than hide it, so the row still says why that headroom is unusable.
+            if acc.disabled:
+                entry.append("  (disabled)", style=palette.muted)
+                key = 1000.0
+            ranked.append((key, acc.number))
             lines[acc.number] = entry
 
         text = Text()

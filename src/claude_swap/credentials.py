@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
@@ -204,19 +205,43 @@ SHARED_CREDENTIAL_KEYS = frozenset({
     "pluginSecrets",
 })
 
+# Claude Code's separate Claude Design credential, written by /design-login.
+# It has its own OAuth client and refresh token, and Claude Code does not check
+# it against the login beside it, so a design login granted to one account
+# keeps working while another account is logged in. Claude Code revokes and
+# deletes it on /login and /logout.
+DESIGN_CREDENTIAL_KEY = "designOauth"
+
 # Account-scoped siblings cswap knows about, named so the unrecognized-key
 # probe below doesn't flag them: claudeAiOauth is the login itself,
-# trustedDeviceToken is enrolled per (device, account) at /login.
+# trustedDeviceToken is enrolled per (device, account) at /login, and
+# designOauth stays with the slot unless the swap.designLogin setting is off.
 ACCOUNT_CREDENTIAL_KEYS = frozenset({
     "claudeAiOauth",
     "trustedDeviceToken",
+    DESIGN_CREDENTIAL_KEY,
 })
 
 
-def shared_credential_fields(credentials: str | None) -> dict | None:
+def shared_credential_keys(swap_design_login: bool = True) -> frozenset[str]:
+    """The live-owned sibling keys for one activation.
+
+    ``SHARED_CREDENTIAL_KEYS``, plus ``designOauth`` when ``swap.designLogin``
+    is off: the live design login then wins over the target slot's snapshot,
+    presence and absence alike.
+    """
+    if swap_design_login:
+        return SHARED_CREDENTIAL_KEYS
+    return SHARED_CREDENTIAL_KEYS | {DESIGN_CREDENTIAL_KEY}
+
+
+def shared_credential_fields(
+    credentials: str | None, keys: frozenset[str] = SHARED_CREDENTIAL_KEYS
+) -> dict | None:
     """Return the machine-shared fields of a Claude OAuth credential object.
 
-    Only the ``SHARED_CREDENTIAL_KEYS`` allowlist is machine-shared; other
+    Only the ``keys`` allowlist is machine-shared (``SHARED_CREDENTIAL_KEYS``
+    unless the caller widens it with ``shared_credential_keys``); other
     siblings of ``claudeAiOauth`` are account-scoped or unknown and stay
     slot-owned. ``None`` means the input is not a JSON credential object
     (missing, malformed, or a managed API key). A dictionary — including
@@ -231,18 +256,20 @@ def shared_credential_fields(credentials: str | None) -> dict | None:
         # safe), but silently: if Claude Code grows a new *shared* key,
         # that default quietly reintroduces the stale-restore papercut for
         # it — leave a trace so it gets noticed.
-        unrecognized = data.keys() - SHARED_CREDENTIAL_KEYS - ACCOUNT_CREDENTIAL_KEYS
+        unrecognized = data.keys() - keys - ACCOUNT_CREDENTIAL_KEYS
         if unrecognized:
             _logger.debug(
                 "Live credential has sibling keys cswap does not recognize "
                 "(a newer Claude Code?), treating them as slot-owned: %s",
                 sorted(unrecognized),
             )
-    return {key: data[key] for key in SHARED_CREDENTIAL_KEYS if key in data}
+    return {key: data[key] for key in keys if key in data}
 
 
 def merge_shared_credential_fields(
-    target_credentials: str, shared_fields: dict
+    target_credentials: str,
+    shared_fields: dict,
+    keys: frozenset[str] = SHARED_CREDENTIAL_KEYS,
 ) -> str:
     """Compose a target Claude login with the machine's shared fields.
 
@@ -261,7 +288,7 @@ def merge_shared_credential_fields(
     composed = {
         key: value
         for key, value in target.items()
-        if key not in SHARED_CREDENTIAL_KEYS
+        if key not in keys
     }
     composed.update(shared_fields)
     return json.dumps(composed)
@@ -334,6 +361,16 @@ class CredentialStore:
         # superseded generation. A fact about THIS item, which is why neither
         # flag above can stand in for it.
         self._residual_verdict: bool | None = None
+        # Whether the current pin came from the OAuth write fallback, i.e. it
+        # points at ``.credentials.json``. The managed-key fallback pins too,
+        # but onto ``primaryApiKey`` — a different file, and no reason to
+        # expect the OAuth one. See _lift_pin_if_oauth_file_gone.
+        self._pinned_to_oauth_file: bool = False
+        # The menu bar's display worker and its engine thread share one store;
+        # the lift's check-then-reset must not interleave with a fresh pin.
+        # Held around every pin and every flag change outside __init__; never
+        # taken inside _pin_file_mode itself, so callers can hold it across it.
+        self._pin_lock = threading.Lock()
         self._last_active_credentials_backend: str | None = None
 
     def _kc_call(self, fn, *args):
@@ -360,10 +397,21 @@ class CredentialStore:
             # choice. See `_keychain_unreadable`.
             self._keychain_op_failed = True
             self._keychain_usable_cache = False
+            # NOT re-armed after an UNVERIFIED pin. `_pin_file_mode` zeroes this
+            # deadline so no re-probe can route back onto a residual it could not
+            # verify-clear, and the backup paths reach here without consulting
+            # `_use_keychain` — an idle slot's failing read, or the
+            # `_delete_backup_keychain_quiet` that every post-pin backup write
+            # runs, handed the pin a fresh 60s expiry, after which a recovered
+            # Keychain answered the active read with the account the user just
+            # switched AWAY from, reported as clean. A VERIFIED clear keeps its
+            # re-arm: nothing can shadow the file there, and the pin settled the
+            # failure flags precisely so a later failure is theirs to answer.
             # Monotonic so a wall-clock jump can't expire the cooldown early/late.
-            self._keychain_disabled_until = (
-                time.monotonic() + KEYCHAIN_RECHECK_COOLDOWN_S
-            )
+            if self._residual_verdict is not False:
+                self._keychain_disabled_until = (
+                    time.monotonic() + KEYCHAIN_RECHECK_COOLDOWN_S
+                )
             raise
         # A SUCCESS is an observation too, and it is the newer one. Recording
         # only failures made `_keychain_op_failed` monotone, and the cooldown
@@ -432,15 +480,65 @@ class CredentialStore:
         self._keychain_disabled_until = 0.0
         self._file_mode_is_ours = True
         self._residual_verdict = residual_cleared
+        # Only the OAuth write fallback may mark a pin as liftable, and it does
+        # so right after this call. Every other pin (the managed-key fallback,
+        # whose residual is the "Claude Code" item) resets it here, so a stale
+        # True can never lift a pin it does not describe.
+        self._pinned_to_oauth_file = False
         if residual_cleared:
             # Settle what happened before; later failures are the flags'
-            # question again. `_kc_call` re-arms the cooldown on any failure
-            # with no pin check, and backup reads reach it without consulting
-            # `_use_keychain`, so the active read IS reachable after a pin.
+            # question again. `_kc_call` re-arms the cooldown on a later
+            # failure under THIS verdict, and backup reads reach it without
+            # consulting `_use_keychain`, so the active read IS reachable
+            # after a verified pin.
             # Measured: a stored True made a genuine later failure read
             # degraded=False and disarmed the capture guard.
             self._keychain_op_failed = False
             self._active_read_failed = False
+
+    def _lift_pin_if_oauth_file_gone(self) -> None:
+        """End a pinned file mode once the file it points at no longer exists.
+
+        The pin is a claim about ``.credentials.json``: our fallback write put
+        the credential there, and a residual Keychain item might shadow it, so
+        this process keeps reading the file. With the file gone there is
+        nothing left to protect — and nothing left to read. Claude Code removes
+        the plaintext file when it stores a rotation in the Keychain, so on a
+        long-running process (menu bar, ``cswap auto``, TUI) the pin outlives
+        its file within hours, and from then on every active read returns ""
+        for the life of the process: usage is unknown, auto-switch fails over
+        into a switch that refuses ("credential is empty"), and only a fresh
+        process recovers.
+
+        A residual is not a reason to stay pinned here either. Claude Code
+        reads Keychain-first, so with our file gone a surviving item is what
+        Claude Code itself is using — the live credential by definition.
+
+        This only RE-ASKS the Keychain. It records no verdict: the read that
+        follows goes through ``_kc_call`` like any other and reports its own
+        outcome, including a Keychain that is still unreadable.
+        """
+        if not self._pinned_to_oauth_file:
+            return
+        with self._pin_lock:
+            if not self._pinned_to_oauth_file or self._use_keychain():
+                return
+            if self._keychain_disabled_until:
+                return  # a later failure re-armed the cooldown; let it run
+            try:
+                cred_file = get_credentials_path()
+                if cred_file.exists() and cred_file.stat().st_size > 0:
+                    return
+            except OSError:
+                return  # cannot tell; the pin is the conservative answer
+            self._keychain_usable_cache = None
+            self._file_mode_is_ours = False
+            self._pinned_to_oauth_file = False
+            self._residual_verdict = None
+        self._host._logger.info(
+            "Active credentials file is gone; reading the Keychain again "
+            "(file mode had been pinned by a failed Keychain write)."
+        )
 
     @property
     def _keychain_unreadable(self) -> bool:
@@ -603,6 +701,7 @@ class CredentialStore:
         # codebase either: session.keychain_service_name codifies claude's
         # derivation (pinned against its source) and the delete, session-read
         # and capture paths already depend on it.
+        self._lift_pin_if_oauth_file_gone()
         if self._use_keychain():
             val, keychain_failed = self._read_active_oauth_keychain()
             # THIS read's own verdict, kept so a later success on some OTHER
@@ -886,7 +985,8 @@ class CredentialStore:
             # MANAGED one, and nothing deleted it — ``_clear_oauth_credential``
             # above removes the OAuth item, a different service. Unverified, so
             # the conservative verdict is the true one.
-            self._pin_file_mode(residual_cleared=False)
+            with self._pin_lock:
+                self._pin_file_mode(residual_cleared=False)
         self._last_active_credentials_backend = (
             "keychain" if wrote_to_keychain else "file"
         )
@@ -942,7 +1042,13 @@ class CredentialStore:
         Best-effort: a down Keychain or missing file is fine. Removing
         ``.credentials.json`` stops Claude Code from falling back to a stale OAuth
         login over the just-activated API key.
+
+        WE remove the file here, so its absence says nothing about Claude Code
+        having moved the credential to the Keychain — the premise
+        ``_lift_pin_if_oauth_file_gone`` rests on. Disarm the lift first.
         """
+        with self._pin_lock:
+            self._pinned_to_oauth_file = False
         self._delete_active_keychain_entry()
         cred_file = get_credentials_path()
         try:
@@ -1006,7 +1112,9 @@ class CredentialStore:
             # that residual and resurrect the wrong account (see _pin_file_mode).
             # Its outcome is also the answer to whether the file is now the
             # authority, so hand it over rather than re-deriving it from flags.
-            self._pin_file_mode(residual_cleared=cleared)
+            with self._pin_lock:
+                self._pin_file_mode(residual_cleared=cleared)
+                self._pinned_to_oauth_file = True
         self._last_active_credentials_backend = "file"
 
     def _refresh_stale_credentials_file(self, credentials: str) -> None:
@@ -1196,7 +1304,13 @@ class CredentialStore:
             enc_present = True
         if enc_present:
             try:
-                encoded = enc_file.read_text(encoding="utf-8").strip()
+                # BYTES, not text: `read_text` decodes inside the read and
+                # `UnicodeDecodeError` is a `ValueError`, so a .enc of garbled
+                # bytes escaped this arm AND the corrupt-content arm below, and
+                # raised out of a reader whose contract is `""`. Garbled bytes
+                # are what that second arm exists for, and `b64decode` rejects
+                # them there. Same split as `_read_stash_manifest_ex`.
+                encoded = enc_file.read_bytes().strip()
             except OSError as e:
                 # The .enc EXISTS but could not be read (permissions, a
                 # mid-unmount, ...) — a real read failure, not "no backup".
@@ -1387,10 +1501,10 @@ class CredentialStore:
         never serve them. The best-effort variant remains right for
         post-commit cleanup, where a failure only leaks an unreferenced file.
         """
-        # Best-effort sweep first: same cruft cleanup (legacy alias, .prev,
-        # quiet Keychain) a normal delete performs.
-        self._delete_account_credentials(account_num, email)
-        # Then assure the served key really is gone, propagating failures.
+        # Clear the served key first, propagating failures. Do not run the
+        # best-effort sweep before this: it can delete the Keychain copy and
+        # only then discover that the file backend is inaccessible, leaving a
+        # failed transaction with credential material already destroyed.
         # Unconditional unlink: exists() returns False on an inaccessible
         # directory, which would fail open here — missing is fine
         # (missing_ok), permission/I/O errors must abort the commit.
@@ -1403,6 +1517,9 @@ class CredentialStore:
                 f"Could not clear stored credentials for slot {account_num} "
                 f"({email}) — aborting before commit: {e}"
             ) from e
+        # With the served key gone, sweep legacy aliases and .prev material.
+        # Failures here only leave unreferenced recovery cruft.
+        self._delete_account_credentials(account_num, email)
         # Final belt: catches any backend view the deletes above missed. The
         # plain reader cannot serve this — it is the exact reader this
         # docstring says "conflates absent with unreadable" — so an
@@ -1822,7 +1939,11 @@ class CredentialStore:
         """
         path = self._stash_entry_path(entry_id)
         try:
-            encoded = path.read_text(encoding="utf-8").strip()
+            # BYTES for the same reason as the backup read above: undecodable
+            # bytes are a CORRUPT entry, the verdict the base64 arm below
+            # already gives, not an exception out of the reader the adopt path
+            # relies on to answer.
+            encoded = path.read_bytes().strip()
         except FileNotFoundError:
             return "", False
         except OSError as e:

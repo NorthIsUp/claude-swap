@@ -17,7 +17,9 @@ from pathlib import Path
 import pytest
 
 from claude_swap import menubar
+from claude_swap.autoswitch import ErrorEvent
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.menubar import ENGINE_ERROR_REPEAT_S, should_surface_engine_error
 from claude_swap.switcher import USAGE_API_KEY
 
 
@@ -238,6 +240,18 @@ def test_format_account_label_disabled_marker():
     assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
 
 
+def test_format_account_label_expires_marker():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, expires_at="2026-09-16")
+    assert label == "2  loc@papaya.asia  (expires 2026-09-16)  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_disabled_and_expires_markers_combine():
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", _USAGE, disabled=True, expires_at="2026-09-16"
+    )
+    assert label == "2  loc@papaya.asia  (disabled)  (expires 2026-09-16)  5h 42% · 7d 18% · $ 30%"
+
+
 # --- usage logging -------------------------------------------------------------
 
 def test_format_usage_log_full():
@@ -310,6 +324,83 @@ def test_format_title_both_windows():
 def test_format_title_both_windows_with_name():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42% · 18%"
+
+
+_OTHER = {"five_hour": {"pct": 7.0}, "seven_day": {"pct": 3.0}}
+
+
+def test_format_title_ignores_others_by_default():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
+    assert menubar.format_title(
+        "loc@papaya.asia", _USAGE, s, others=[("work", _OTHER)]
+    ) == "⇄ loc · 42% · 18%"
+
+
+def test_format_title_all_accounts_appends_others():
+    s = menubar.MenuBarSettings(
+        show_account_name=True, title_pct="both", title_all_accounts=True
+    )
+    assert menubar.format_title(
+        "loc@papaya.asia", _USAGE, s, others=[("work", _OTHER)]
+    ) == "⇄ loc · 42% · 18% | work · 7% · 3%"
+
+
+def test_format_title_all_accounts_skips_accounts_with_nothing_to_show():
+    s = menubar.MenuBarSettings(
+        show_account_name=False, title_pct="5h", title_all_accounts=True
+    )
+    # "no credentials" is a sentinel string, not a usage dict — no pct to render.
+    assert menubar.format_title(
+        "loc@papaya.asia", _USAGE, s, others=[("work", "no credentials")]
+    ) == "⇄ 42%"
+
+
+def test_format_title_all_accounts_with_no_others_is_unchanged():
+    s = menubar.MenuBarSettings(
+        show_account_name=True, title_pct="5h", title_all_accounts=True
+    )
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42%"
+
+
+def test_format_title_countdown_appends_reset_time():
+    s = menubar.MenuBarSettings(
+        show_account_name=True, title_pct="both", title_countdown=True
+    )
+    now = _NOW
+    usage = {
+        "five_hour": {"pct": 42.0, "resets_at": _iso(2 * 3600 + 53 * 60)},
+        "seven_day": {"pct": 18.0, "resets_at": _iso(26 * 3600)},
+    }
+    assert menubar.format_title(
+        "loc@papaya.asia", usage, s, now=now
+    ) == "\u21c4 loc · 42% (2h 53m) · 18% (1d 2h)"
+
+
+def test_format_title_countdown_off_by_default():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
+    now = _NOW
+    usage = {"five_hour": {"pct": 42.0, "resets_at": _iso(3600)}}
+    assert menubar.format_title("loc@papaya.asia", usage, s, now=now) == "\u21c4 loc · 42%"
+
+
+def test_format_title_countdown_skips_window_without_resets_at():
+    # pct still renders; only the countdown is dropped when resets_at is absent.
+    s = menubar.MenuBarSettings(
+        show_account_name=False, title_pct="5h", title_countdown=True
+    )
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "\u21c4 42%"
+
+
+def test_format_title_countdown_applies_to_other_accounts():
+    s = menubar.MenuBarSettings(
+        show_account_name=True, title_pct="5h",
+        title_all_accounts=True, title_countdown=True,
+    )
+    now = _NOW
+    other = {"five_hour": {"pct": 7.0, "resets_at": _iso(45 * 60)}}
+    assert menubar.format_title(
+        "loc@papaya.asia", _USAGE, s, now=now, others=[("work", other)]
+    ) == "\u21c4 loc · 42% | work · 7% (45m)"
 
 
 def test_format_title_icon_only_when_off():
@@ -449,13 +540,14 @@ class _FakeEntry:
 
 
 class _FakeAcct:
-    def __init__(self, number, email, is_active, usage, alias="", disabled=False):
+    def __init__(self, number, email, is_active, usage, alias="", disabled=False, expires_at=None):
         self.number = number
         self.email = email
         self.is_active = is_active
         self.usage = usage
         self.alias = alias
         self.disabled = disabled
+        self.expires_at = expires_at
 
 
 class _FakeSnap:
@@ -478,17 +570,22 @@ def test_adapt_snapshot_shape_and_active_selection():
     lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     accts = [
         _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0)),
-        _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY), disabled=True),
+        _FakeAcct(
+            "2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY),
+            disabled=True, expires_at="2026-09-16",
+        ),
     ]
     snap = menubar._adapt_snapshot(_FakeSnap(accts))
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
     assert snap["active_alias"] == ""
-    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at)
-    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0)
-    # sentinel account: display is the human note, last_good/fetched_at are None; disabled carried through
+    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at, expires_at)
+    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0, None)
+    # sentinel account: display is the human note, last_good/fetched_at are None;
+    # disabled and expires_at both carried through
     assert snap["accounts"][1] == (
         "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None,
+        "2026-09-16",
     )
 
 
@@ -617,3 +714,60 @@ class TestFrameworkBuildWarning:
         # The symptom is that everything looks healthy, so say so.
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "logs nothing" in msg
+
+
+# --- engine errors must not vanish -------------------------------------------
+#
+# The hosted auto-switch engine reports a failed tick as an ErrorEvent. The
+# menu bar dropped those: nothing in the log, nothing on screen. Field case —
+# every tick's switch raised "Current account credential is empty" for two
+# days while the icon sat there looking healthy.
+
+
+def test_engine_error_is_surfaced_the_first_time():
+    ev = ErrorEvent(message="Current account credential is empty")
+    assert should_surface_engine_error(ev, {}, now=1000.0) is True
+
+
+def test_engine_error_repeating_every_tick_is_not_a_notification_storm():
+    ev = ErrorEvent(message="Current account credential is empty")
+    seen: dict = {}
+    assert should_surface_engine_error(ev, seen, now=1000.0) is True
+    assert should_surface_engine_error(ev, seen, now=1060.0) is False
+
+
+def test_engine_error_resurfaces_after_the_quiet_period():
+    ev = ErrorEvent(message="Current account credential is empty")
+    seen: dict = {}
+    should_surface_engine_error(ev, seen, now=1000.0)
+    assert should_surface_engine_error(ev, seen, now=1000.0 + ENGINE_ERROR_REPEAT_S) is True
+
+
+def test_two_alternating_engine_errors_are_each_limited():
+    a = ErrorEvent(message="Current account credential is empty")
+    b = ErrorEvent(message="Claude config file not found")
+    seen: dict = {}
+    surfaced = [
+        should_surface_engine_error(ev, seen, now=1000.0 + 60 * i)
+        for i, ev in enumerate([a, b, a, b, a, b])
+    ]
+    assert surfaced == [True, True, False, False, False, False]
+
+
+def test_engine_errors_differing_only_in_numbers_are_one_error():
+    seen: dict = {}
+    first = ErrorEvent(message="LockError: lock held by pid 4242 for 31s")
+    later = ErrorEvent(message="LockError: lock held by pid 4243 for 92s")
+    assert should_surface_engine_error(first, seen, now=1000.0) is True
+    assert should_surface_engine_error(later, seen, now=1060.0) is False
+
+
+def test_engine_error_table_is_pruned():
+    seen: dict = {}
+    for i in range(50):
+        should_surface_engine_error(
+            ErrorEvent(message=f"error kind {chr(65 + i % 26)}{i}"), seen, now=0.0
+        )
+    should_surface_engine_error(ErrorEvent(message="x"), seen, now=ENGINE_ERROR_REPEAT_S)
+    assert list(seen) == ["x"]
+
