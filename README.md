@@ -96,7 +96,7 @@ Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy bes
 
 Canceling a subscription on a known date? Record it and drain that account first — `cswap expires 2 2026-09-16`, then `cswap switch --strategy expiring` jumps to the soonest-expiring account that still has room (below the `autoswitch.threshold`, default 90%); an expiring account already at its limit is skipped for the next one, and the output says when it frees up. cswap can't see billing state, only the 5h/7d windows, so the date has to come from you; `cswap expires` alone lists what's recorded.
 
-**Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
+**Note:** Switching publishes the selected authentication through Claude Code’s live user-settings reload, so running sessions can switch between OAuth and API keys without restarting. Allow settings reload to finish before sending the next message. OAuth credential changes on macOS can additionally take about 30 seconds for the Keychain cache to expire. Requests already in flight finish with their original credential.
 
 ### Automatic switching
 
@@ -149,12 +149,15 @@ cswap run user@example.com      # by email
 cswap run 2 -- --resume         # everything after '--' is forwarded to claude
 cswap run 2 --share-history     # share your chat history with this account too
 cswap run 2 --share-plugins     # share your installed plugins too
+cswap run 4 --share-history -- --continue  # resume a conversation using API-key account 4
 cswap run 2 --require-session   # refuse rather than run plain claude if 2 is the default login
 ```
 
 Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history and plugin installs — pass `--share-history` if you want your accounts to continue the same conversations, and `--share-plugins` if a plugin installed once should be available everywhere.
 
-Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses in that case instead.
+API-key accounts also support session mode, including when the same key is the default login. The selected key is passed to the launched process through `ANTHROPIC_API_KEY`. Explicit session profiles keep their selected account when the default login switches. While live authentication is enabled, their shared settings become a copy of your preferences with global authentication overrides removed; that copy is refreshed on each launch. Close the old session before resuming its conversation in a different process.
+
+Running the OAuth account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). API-key accounts always use an isolated session profile. Scripts that need the isolation guaranteed can pass `--require-session`, which refuses in that case instead.
   
 A session refreshes its own copy of the account's token, so once it exits, the credential it rotated is captured back into the account's stored backup before a switch or usage check uses that backup. While a session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail); exit the session first, or pick another account. While a session runs, its account's usage is read with the session's own credential and never refreshed by cswap; a read the server refuses shows as token expired, and is not requested again, until the session renews the credential on its next call.
 
@@ -236,7 +239,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 
 ## Tips
 
-- **Do you need to restart after switching?** Usually not. On **Linux and Windows**, credentials are stored in a file and Claude Code re-reads them whenever that file changes, so the new account takes effect on your next message — no restart needed. On **macOS**, credentials live in the Keychain, which Claude Code caches for about 30 seconds; a running session picks up the switch once that cache expires. Restart Claude Code (or close and reopen the VS Code extension tab) only if you want the change to apply instantly.
+- **Do you need to restart after switching?** No for normal CLI sessions that reload user settings. The switcher updates `env.ANTHROPIC_API_KEY` in the watched user settings to bypass Claude’s process-lifetime managed-key cache. On returning to OAuth it writes an explicit empty value: deleting the setting leaves the old key in the running process’s environment. The API key is present in the private, mode-0600 user settings file while active and is cleared when switching back to OAuth. Verified with Claude Code 2.1.285 and 2.1.301. `--bare`, host-managed authentication, settings sources that exclude user settings, and higher-priority auth overrides can bypass this mechanism.
 - **Continuing sessions after switching:** You can keep using the same Claude Code session after switching — run `cswap switch` in any terminal and carry on. If you'd prefer a clean start, close and reopen Claude Code (or the VS Code extension tab) and use `--resume` to pick your previous session. Either way, the first message on the new account may use extra usage as its conversation cache rebuilds.
 
 ## How it works
@@ -430,6 +433,8 @@ cswap add-token --email user@example.com     # optional label override
 setup-token. It switches like any other account; since API keys have no subscription
 quota, they show no usage and the usage-aware `switch` strategies never skip them as
 rate-limited.
+
+The switcher also publishes the key to Claude’s watched user settings, so existing normal CLI processes use it after settings reload. The managed-key Keychain item remains in place for fresh launches. Switching back to OAuth clears the settings override explicitly, including any stale API key in a running process’s settings environment.
 
 ## Uninstall
 
