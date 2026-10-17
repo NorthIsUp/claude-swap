@@ -1102,14 +1102,8 @@ class AutoSwitchEngine:
             self._check_model_names(quarantined, usage)
 
         active_is_api_key = self.switcher.account_kind_for(current) == "api_key"
-        if active_is_api_key and not settings.include_api_key_accounts:
-            self._emit(
-                NoSwitchEvent(
-                    reason="active-api-key",
-                    detail="API-key accounts have no quota to watch",
-                )
-            )
-            return TickOutcome.NO_ACTION
+        # include_api_key_accounts controls destinations, not departures:
+        # a manually selected key must still yield to a recovered subscription.
 
         active_headroom = headroom.get(current)
         if active_is_api_key:
