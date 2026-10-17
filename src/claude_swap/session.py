@@ -598,9 +598,7 @@ class SessionManager:
             )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
-        # Guard before the same-account direct-launch fast path below (which
-        # _exec's claude and never returns) — and before setup_session.
-        self._ensure_not_api_key(account_num, email)
+        is_api_key = self.switcher._account_kind(account_num) == "api_key"
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
         if config_dir_preset:
@@ -617,7 +615,7 @@ class SessionManager:
             # two copies of one account can drift if the server rotates the
             # refresh token.
             current = self.switcher._get_current_account()
-            if current is not None and current == (email, org_uuid):
+            if not is_api_key and current is not None and current == (email, org_uuid):
                 if require_session:
                     raise SessionError(
                         f"Account-{account_num} ({email}) is the active default "
@@ -654,6 +652,10 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+        if is_api_key:
+            # Explicit environment auth takes precedence over a cached default
+            # login. Never put the key in argv, shared settings, or OAuth JSON.
+            env["ANTHROPIC_API_KEY"] = self._session_api_key(account_num, email)
         self._exec(claude_bin, claude_args, env=env)
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
@@ -690,19 +692,59 @@ class SessionManager:
         os.execvpe(claude_bin, argv, env)
         raise AssertionError("unreachable")  # pragma: no cover
 
-    def _ensure_not_api_key(self, account_num: str, email: str) -> None:
-        """Reject API-key accounts in session mode (not supported yet).
-
-        Session bootstrap is OAuth-shaped — it seeds ``.credentials.json`` and
-        ``_is_session_valid`` requires ``authMethod == "claude.ai"`` — so an API-key
-        account would otherwise fail validation opaquely. Raise early with guidance.
-        """
-        if self.switcher._account_kind(account_num) == "api_key":
+    def _session_api_key(self, account_num: str, email: str) -> str:
+        """Read the selected key without consulting the active default login."""
+        key, unreadable = self.switcher._read_account_credentials_ex(account_num, email)
+        if unreadable:
             raise SessionError(
-                f"Account-{account_num} ({email}) is an API-key account; "
-                "'cswap run' (session mode) does not support API-key accounts yet. "
-                "Use 'cswap --switch-to' to make it your default login instead."
+                f"Account-{account_num}'s API key is unreadable right now. "
+                "Unlock the Keychain and retry; do not re-add the account."
             )
+        from claude_swap.credentials import looks_like_api_key
+
+        if not looks_like_api_key(key):
+            raise SessionError(f"Account-{account_num} has no valid stored API key.")
+        return key.strip()
+
+    def _setup_api_key_session(
+        self, session_dir: Path, account_num: str, email: str,
+        share: bool, share_history: bool, share_plugins: bool,
+    ) -> None:
+        """Prepare preferences/history; the credential is supplied only at exec.
+
+        API keys have no rotating refresh grant, so concurrent launches can
+        safely use the same key. OAuth bootstrap/probes would instead copy raw
+        key bytes into .credentials.json and reject a correctly authenticated
+        API session for not being a claude.ai login.
+        """
+        from claude_swap.credentials import approved_form
+
+        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            key = self._session_api_key(account_num, email)
+            session_dir.mkdir(parents=True, exist_ok=True)
+            if sys.platform != "win32":
+                os.chmod(session_dir, 0o700)
+            config_path = session_dir / ".claude.json"
+            with proper_lockfile(config_path.with_name(config_path.name + ".lock")):
+                try:
+                    config = json.loads(config_path.read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    config = {}
+                except (OSError, ValueError) as exc:
+                    raise SessionError("Cannot read the API-key session config; left in place.") from exc
+                if not isinstance(config, dict):
+                    raise SessionError("Invalid API-key session config; left in place.")
+                # Do not borrow an identity from the default OAuth account.
+                config.pop("oauthAccount", None)
+                config["hasCompletedOnboarding"] = True
+                config.setdefault("theme", "dark")
+                responses = config.setdefault("customApiKeyResponses", {})
+                approved = responses.setdefault("approved", [])
+                suffix = approved_form(key)
+                if suffix not in approved:
+                    approved.append(suffix)
+                atomic_write_json(config_path, config)
+            self._sync_sharing(session_dir, share, share_history, share_plugins)
 
     # -- bootstrap -------------------------------------------------------
 
@@ -715,9 +757,12 @@ class SessionManager:
     ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email)."""
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
-        # Defense-in-depth: also guard here (run() guards before its fast path).
-        self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+        if self.switcher._account_kind(account_num) == "api_key":
+            self._setup_api_key_session(
+                session_dir, account_num, email, share, share_history, share_plugins
+            )
+            return session_dir, account_num, email
 
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
@@ -1186,6 +1231,17 @@ class SessionManager:
                 if name in managed:
                     self._remove_managed(dest)
                 continue
+
+            if name == "settings.json":
+                from claude_swap.live_auth import (
+                    LIVE_AUTH_MARKER, read_settings, snapshot_session_settings,
+                )
+                shared_settings = read_settings(src)
+                if shared_settings.get("env", {}).get(LIVE_AUTH_MARKER) == "1":
+                    if not dest.exists() or dest.is_symlink() or name in managed:
+                        snapshot_session_settings(shared_settings, dest)
+                        new_managed.append(name)
+                    continue
 
             # Link to the fully resolved target. When ~/.claude/<name> is itself
             # a symlink (a dotfiles setup), linking to the unresolved path makes

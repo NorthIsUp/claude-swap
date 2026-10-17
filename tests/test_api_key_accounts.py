@@ -3,7 +3,7 @@
 Covers kind detection, ``--add-token`` auto-detection, the cross-kind collision
 guard, the ``add_account`` live-key guard, kind+platform-aware active credential
 read/write with OAuth↔API-key mutual exclusion, the "API key — no quota" usage
-display, the ``cswap run`` session guard, and export/import of raw keys.
+display, isolated ``cswap run`` API-key sessions, and export/import of raw keys.
 """
 
 from __future__ import annotations
@@ -309,22 +309,119 @@ class TestAddAccountGuard:
 # ---------------------------------------------------------------------------
 
 
-class TestSessionGuard:
+class TestApiKeySessions:
     def _seed_api_key_account(self) -> ClaudeAccountSwitcher:
         s = _linux_switcher()
         s.add_account_from_token(API_KEY, slot=2)
         return s
 
-    def test_setup_session_rejects(self, temp_home: Path):
-        mgr = SessionManager(self._seed_api_key_account())
-        with pytest.raises(SessionError, match="does not support API-key accounts"):
-            mgr.setup_session("2", share=True)
+    def test_profile_has_no_raw_key_or_oauth_identity(self, temp_home: Path):
+        s = self._seed_api_key_account()
+        mgr = SessionManager(s)
+        with patch.object(mgr, "_session_validity", side_effect=AssertionError("OAuth probe")):
+            profile, num, email = mgr.setup_session("2", share=False)
+        cfg = json.loads((profile / ".claude.json").read_text())
+        assert cfg["hasCompletedOnboarding"] is True
+        assert API_KEY[-20:] in cfg["customApiKeyResponses"]["approved"]
+        assert "oauthAccount" not in cfg
+        assert "primaryApiKey" not in cfg
+        assert API_KEY not in (profile / ".claude.json").read_text()
+        assert not (profile / ".credentials.json").exists()
+        assert (num, email) == ("2", "api-key-2@token.local")
 
-    def test_run_rejects_before_exec(self, temp_home: Path, monkeypatch):
-        mgr = SessionManager(self._seed_api_key_account())
+    def test_run_uses_stored_key_and_preserves_default_login(
+        self, temp_home: Path, monkeypatch, capsys
+    ):
+        s = self._seed_api_key_account()
+        s._write_credentials(OAUTH_JSON)
+        get_global_config_path().write_text(json.dumps({"oauthAccount": {"emailAddress": "other@example.com"}}))
+        before = get_global_config_path().read_bytes()
+        mgr = SessionManager(s)
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: "/fake/claude")
-        with pytest.raises(SessionError, match="does not support API-key accounts"):
-            mgr.run("2", [], share=True)
+        for name in session_mod.AUTH_OVERRIDE_ENV_VARS:
+            monkeypatch.setenv(name, "inherited-wrong-credential")
+        with patch.object(mgr, "_exec", side_effect=SystemExit) as launch:
+            with pytest.raises(SystemExit):
+                mgr.run("2", ["--continue"], share=True, share_history=True, require_session=True)
+        binary, args = launch.call_args.args
+        env = launch.call_args.kwargs["env"]
+        assert binary == "/fake/claude"
+        assert args == ["--continue"]
+        assert env["ANTHROPIC_API_KEY"] == API_KEY
+        assert not any(k in env for k in session_mod.AUTH_OVERRIDE_ENV_VARS if k != "ANTHROPIC_API_KEY")
+        profile = Path(env["CLAUDE_CONFIG_DIR"])
+        assert (profile / "projects").resolve() == (temp_home / ".claude/projects").resolve()
+        assert get_global_config_path().read_bytes() == before
+        assert get_credentials_path().read_text() == OAUTH_JSON
+        assert API_KEY not in capsys.readouterr().out
+
+    def test_active_api_account_still_gets_isolated_profile(self, temp_home, monkeypatch):
+        s = self._seed_api_key_account()
+        mgr = SessionManager(s)
+        monkeypatch.setattr(session_mod.shutil, "which", lambda name: "/fake/claude")
+        monkeypatch.setattr(s, "_get_current_account", lambda: ("api-key-2@token.local", ""))
+        with patch.object(mgr, "_exec", side_effect=SystemExit) as launch:
+            with pytest.raises(SystemExit):
+                mgr.run("2", [], share=False, require_session=True)
+        assert launch.call_args.kwargs["env"]["ANTHROPIC_API_KEY"] == API_KEY
+        assert "CLAUDE_CONFIG_DIR" in launch.call_args.kwargs["env"]
+
+    def test_relaunch_uses_replaced_key_without_losing_profile_history(self, temp_home, monkeypatch):
+        s = self._seed_api_key_account()
+        mgr = SessionManager(s)
+        profile, num, email = mgr.setup_session("2", share=False)
+        history = profile / "projects/keep.jsonl"
+        history.parent.mkdir()
+        history.write_text("conversation")
+        s._write_account_credentials(num, email, OTHER_KEY)
+        monkeypatch.setattr(session_mod.shutil, "which", lambda name: "/fake/claude")
+        with patch.object(mgr, "_exec", side_effect=SystemExit) as launch:
+            with pytest.raises(SystemExit):
+                mgr.run("2", [], share=False)
+        assert launch.call_args.kwargs["env"]["ANTHROPIC_API_KEY"] == OTHER_KEY
+        assert history.read_text() == "conversation"
+
+    def test_unreadable_key_never_falls_back_to_default(self, temp_home):
+        mgr = SessionManager(self._seed_api_key_account())
+        with patch.object(mgr.switcher, "_read_account_credentials_ex", return_value=(None, True)):
+            with pytest.raises(SessionError, match="unreadable"):
+                mgr.setup_session("2", share=False)
+
+    def test_malformed_key_is_not_launched(self, temp_home):
+        s = self._seed_api_key_account()
+        s._write_account_credentials("2", "api-key-2@token.local", OAUTH_JSON)
+        with pytest.raises(SessionError, match="no valid stored API key"):
+            SessionManager(s).setup_session("2", share=False)
+
+    def test_torn_profile_config_is_preserved(self, temp_home):
+        mgr = SessionManager(self._seed_api_key_account())
+        profile, _, _ = mgr.setup_session("2", share=False)
+        cfg = profile / ".claude.json"
+        cfg.write_text('{"projects":')
+        with pytest.raises(SessionError, match="left in place"):
+            mgr.setup_session("2", share=False)
+        assert cfg.read_text() == '{"projects":'
+
+
+class TestApiKeyLiveSwitch:
+    @pytest.mark.parametrize("force", [False, True])
+    def test_switch_into_and_out_of_api_key_publishes_live_settings(self, temp_home, force):
+        s = _linux_switcher()
+        s.add_account_from_token("sk-ant-oat01-test", slot=1)
+        s.add_account_from_token(API_KEY, slot=2)
+        s._perform_switch("1", emit_output=False)
+        for target, expected in (("2", API_KEY), ("1", "")):
+            result = s._perform_switch(target, emit_output=False, force_activate=force)
+            settings = json.loads((temp_home / ".claude/settings.json").read_text())
+            assert settings["env"]["ANTHROPIC_API_KEY"] == expected
+            assert result["warnings"] == []
+
+    def test_live_followup_describes_running_processes(self, temp_home, capsys):
+        s = _linux_switcher()
+        s._print_switch_followup(live_auth=True)
+        output = capsys.readouterr().out
+        assert "Running Claude Code sessions" in output
+        assert "no restart needed" in output
 
 
 # ---------------------------------------------------------------------------

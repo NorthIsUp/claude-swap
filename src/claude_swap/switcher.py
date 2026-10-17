@@ -6841,6 +6841,16 @@ class ClaudeAccountSwitcher:
                     email = (
                         data.get("accounts", {}).get(target_account, {}).get("email", "")
                     )
+                    # An existing install can already have the right managed
+                    # key while its running Claude processes still cache OAuth.
+                    # Re-publish matching live bytes without rewriting the
+                    # credential or touching the account's refresh grant.
+                    if self._account_kind(target_account) == "api_key":
+                        live = self._read_credentials()
+                        backup = self._read_account_credentials(target_account, email)
+                        if looks_like_api_key(live) and live == backup:
+                            from claude_swap.live_auth import publish_live_auth
+                            publish_live_auth(live, self.backup_dir)
                     ref = account_ref(int(target_account), email)
                     if not json_output:
                         print(
@@ -7486,6 +7496,8 @@ class ClaudeAccountSwitcher:
 
                 creds_written = False
                 config_written = False
+                sequence_written = False
+                rollback_sequence = data.copy()
                 try:
                     self._write_credentials(
                         self._prepare_credentials_for_activation(
@@ -7538,7 +7550,12 @@ class ClaudeAccountSwitcher:
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
                     self._write_json(self.sequence_file, data)
+                    sequence_written = True
+                    from claude_swap.live_auth import publish_live_auth
+                    publish_live_auth(target_creds, self.backup_dir)
                 except Exception:
+                    if sequence_written:
+                        self._write_json(self.sequence_file, rollback_sequence)
                     if config_written and rollback_config_text is not None:
                         try:
                             config_path.write_text(
@@ -7573,7 +7590,7 @@ class ClaudeAccountSwitcher:
                         f"{accent('Activated')} Account-{target_account} ({target_email})"
                     )
                     print()
-                    self._print_switch_followup()
+                    self._print_switch_followup(live_auth=True)
                     print()
                 self._replan_new_active(
                     target_account,
@@ -7839,6 +7856,8 @@ class ClaudeAccountSwitcher:
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
                 transaction.record_step("sequence_updated")
+                from claude_swap.live_auth import publish_live_auth
+                publish_live_auth(target_creds, self.backup_dir)
 
                 self._logger.info(
                     f"Switched from account {current_account} to {target_account}"
@@ -7873,7 +7892,7 @@ class ClaudeAccountSwitcher:
                 self._logger.warning(f"Post-switch usage display failed: {e!r}")
                 print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
             print()
-            self._print_switch_followup()
+            self._print_switch_followup(live_auth=True)
             print()
         self._replan_new_active(
             target_account,
@@ -7882,17 +7901,23 @@ class ClaudeAccountSwitcher:
         )
         return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
-    def _print_switch_followup(self) -> None:
+    def _print_switch_followup(self, *, live_auth: bool = False) -> None:
         """Print the note after a successful switch, keyed to where the active
         credential write actually landed.
 
-        A restart is never required: Claude Code clears its cached OAuth token when
+        OAuth-only switches: Claude Code clears its cached OAuth token when
         ``.credentials.json`` changes (file storage — effective on the next message)
         or when the macOS Keychain cache TTL (~30s) expires. Both lines are dim
         hints, not warnings; the Keychain line adds that a restart skips the wait.
         The file line also covers macOS when the Keychain was unavailable and the
         switch fell back to the file.
         """
+        if live_auth:
+            print(dimmed(
+                "Running Claude Code sessions pick up the selected login after "
+                "settings reload — no restart needed."
+            ))
+            return
         backend = self._last_active_credentials_backend
         if backend is None:
             # No write happened this run; fall back to the routing hint.
