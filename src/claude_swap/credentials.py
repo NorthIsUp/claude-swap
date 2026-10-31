@@ -167,15 +167,13 @@ class ActiveCredentials(NamedTuple):
 def looks_like_api_key(credentials: str | None) -> bool:
     """Whether a stored active credential is a raw managed API key vs OAuth JSON.
 
-    Strict on purpose: a managed key is a bare ``sk-ant-api…`` string, while every
-    OAuth/setup-token credential is a JSON object (``{"claudeAiOauth": …}``). Requiring
-    the ``sk-ant-api`` prefix (and that it isn't JSON) keeps a raw/garbled
-    ``sk-ant-oat…`` setup token from ever being misclassified as an API key.
+    Console key families vary; exclude OAuth access/setup and refresh tokens
+    rather than maintaining an allowlist that misclassifies newer API keys.
     """
     if not credentials:
         return False
     text = credentials.strip()
-    return text.startswith("sk-ant-api") and not text.startswith("{")
+    return text.startswith("sk-ant-") and not text.startswith(("sk-ant-oat", "sk-ant-ort"))
 
 
 def _credential_object(credentials: str | None) -> dict | None:
