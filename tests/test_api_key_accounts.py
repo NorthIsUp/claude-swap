@@ -72,8 +72,12 @@ def _read_global_config() -> dict:
 
 
 class TestKindDetection:
-    def test_api_key_detected(self):
-        assert looks_like_api_key(API_KEY) is True
+    @pytest.mark.parametrize(
+        "key", [API_KEY, "sk-ant-usr-1-fake-test-key", "sk-ant-new99-fake-test-key"]
+    )
+    def test_api_key_detected(self, key: str) -> None:
+        assert looks_like_api_key(key) is True
+        assert looks_like_api_key(f"  {key}\n") is True
 
     @pytest.mark.parametrize(
         "value",
@@ -81,8 +85,11 @@ class TestKindDetection:
             "",
             None,
             "sk-ant-oat01-abcdef",  # setup-token, not a key
+            "sk-ant-ort01-abcdef",
+            "  sk-ant-ort01-abcdef\n",
             OAUTH_JSON,  # OAuth JSON blob
             '{"x": "sk-ant-api03-inside-json"}',  # JSON that merely contains a key
+            '{"x": "sk-ant-usr-1-inside-json"}',
         ],
     )
     def test_non_api_key(self, value):
@@ -404,13 +411,16 @@ class TestApiKeySessions:
 
 
 class TestApiKeyLiveSwitch:
+    @pytest.mark.parametrize("key", [API_KEY, "sk-ant-usr-1-fake-test-key"])
     @pytest.mark.parametrize("force", [False, True])
-    def test_switch_into_and_out_of_api_key_publishes_live_settings(self, temp_home, force):
+    def test_switch_into_and_out_of_api_key_publishes_live_settings(
+        self, temp_home: Path, force: bool, key: str
+    ) -> None:
         s = _linux_switcher()
         s.add_account_from_token("sk-ant-oat01-test", slot=1)
-        s.add_account_from_token(API_KEY, slot=2)
+        s.add_account_from_token(key, slot=2)
         s._perform_switch("1", emit_output=False)
-        for target, expected in (("2", API_KEY), ("1", "")):
+        for target, expected in (("2", key), ("1", "")):
             result = s._perform_switch(target, emit_output=False, force_activate=force)
             settings = json.loads((temp_home / ".claude/settings.json").read_text())
             assert settings["env"]["ANTHROPIC_API_KEY"] == expected
