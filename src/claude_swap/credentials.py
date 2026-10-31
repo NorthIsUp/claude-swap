@@ -173,7 +173,9 @@ def looks_like_api_key(credentials: str | None) -> bool:
     if not credentials:
         return False
     text = credentials.strip()
-    return text.startswith("sk-ant-") and not text.startswith(("sk-ant-oat", "sk-ant-ort"))
+    return text.startswith("sk-ant-") and not text.startswith(
+        ("sk-ant-oat", "sk-ant-ort")
+    )
 
 
 def _credential_object(credentials: str | None) -> dict | None:
